@@ -66,7 +66,7 @@ func SearchKnowledge() *ToolDefinition {
 			}
 
 			var results []result
-			source := "db"
+			var source string = "db"
 
 			dbResults, err := SearchKnowledgeFromDB(query, dimension, limit)
 			if err != nil || len(dbResults) == 0 {
@@ -110,7 +110,7 @@ func SearchKnowledge() *ToolDefinition {
 			}
 
 			data, _ := json.Marshal(map[string]interface{}{"query": query, "dimension": dimension, "results": results})
-			return ToolResult{Success: true, Output: string(data), Metadata: map[string]interface{}{"source": "mock"}}
+			return ToolResult{Success: true, Output: string(data), Metadata: map[string]interface{}{"source": source}}
 		},
 	}
 }

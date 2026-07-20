@@ -1,6 +1,9 @@
 package queryengine
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 type QueryEngineOptions struct {
 	Providers       []ProviderConfig
@@ -27,7 +30,31 @@ func NewQueryEngine(opts QueryEngineOptions) *QueryEngine {
 
 //找对的AI、处理流式回复、自动重试，最后给出完整的答案
 func (qe *QueryEngine) Query(params QueryParams) (ParsedResponse, error) {
-	result := qe.router.Resolve(*params.Model)
+	model := ""
+	if params.Model != nil {
+		model = *params.Model
+	}
+	result := qe.router.Resolve(model)
+
+	tools := []ToolSchema{}
+	if params.Tools != nil {
+		tools = *params.Tools
+	}
+
+	maxTokens := 0
+	if params.MaxTokens != nil {
+		maxTokens = *params.MaxTokens
+	}
+
+	temperature := float64(0)
+	if params.Temperature != nil {
+		temperature = *params.Temperature
+	}
+
+	systemPrompt := ""
+	if params.SystemPrompt != nil {
+		systemPrompt = *params.SystemPrompt
+	}
 
 	return WithRetryResult(func() (ParsedResponse, error) {
 		collector := NewStreamCollector()
@@ -35,13 +62,19 @@ func (qe *QueryEngine) Query(params QueryParams) (ParsedResponse, error) {
 		stream := result.Provider.Stream(StreamParams{
 			Model:        result.Model,
 			Messages:     params.Messages,
-			Tools:        *params.Tools,
-			MaxTokens:    *params.MaxTokens,
-			Temperature:  *params.Temperature,
-			SystemPrompt: *params.SystemPrompt,
+			Tools:        tools,
+			MaxTokens:    maxTokens,
+			Temperature:  temperature,
+			SystemPrompt: systemPrompt,
 		})
 
 		for event := range stream {
+			if errorEvent, ok := event.(*ErrorEvent); ok {
+				if errorEvent.Err != nil {
+					return ParsedResponse{}, errorEvent.Err
+				}
+				return ParsedResponse{}, errors.New("model stream returned an unknown error")
+			}
 			collector.Feed(event)
 			if event.GetType() == "text_delta" && params.OnTextDelta != nil {
 				if textDelta, ok := event.(*TextDeltaEvent); ok {

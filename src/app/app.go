@@ -9,9 +9,11 @@ import (
 	"MyOfferPilot/src/memory"
 	"MyOfferPilot/src/permission"
 	queryengine "MyOfferPilot/src/query-engine"
+	"MyOfferPilot/src/query-engine/provider"
 	"MyOfferPilot/src/session"
 	subagent "MyOfferPilot/src/sub-agent"
 	tool "MyOfferPilot/src/tools"
+	"context"
 	"os"
 )
 
@@ -80,7 +82,7 @@ type App struct {
 func CreateApp(opts *AppOptions) *App {
 	logger.DefaultLogger.Info("Creating application...")
 
-	providers := buildProvider()
+	providers := buildProviders()
 	queryEngine := queryengine.NewQueryEngine(queryengine.QueryEngineOptions{Providers: providers})
 
 	toolRegistry := tool.NewToolRegistry()
@@ -92,7 +94,7 @@ func CreateApp(opts *AppOptions) *App {
 		sessionManager = opts.SessionManager
 	} else {
 		var err error
-		sessionManager, err = session.NewSessionManager()
+		sessionManager, err = session.NewSessionManager("")
 		if err != nil {
 			logger.DefaultLogger.Warn("Failed to create session manager", map[string]interface{}{"error": err.Error()})
 			sessionManager = &session.SessionManager{}
@@ -112,7 +114,7 @@ func CreateApp(opts *AppOptions) *App {
 		}
 	}
 
-	subAgentRuntime := subagent.NewSubAgentRuntime(queryengine, &subagent.SubAgentRuntimeOptions{
+	subAgentRuntime := subagent.NewSubAgentRuntime(queryEngine, &subagent.SubAgentRuntimeOptions{
 		MaxConcurrency: 0,
 		ToolRegistry:   toolRegistry,
 	})
@@ -139,7 +141,7 @@ func CreateApp(opts *AppOptions) *App {
 	contextManager.SetLayer(appcontext.ContextWindowKeySystem, SystemPrompt, -1)
 
 	defaultModel := ""
-	if opts != nil && opts.Model != nil {
+	if opts != nil && opts.Model != "" {
 		defaultModel = opts.Model
 	} else {
 		defaultModel = os.Getenv("DEFAULT_MODEL")
@@ -182,5 +184,100 @@ func CreateApp(opts *AppOptions) *App {
 		HookPipeline:    hookPipeline,
 		SubAgentRuntime: subAgentRuntime,
 	}
+
+}
+
+func buildProviders() []queryengine.ProviderConfig {
+	var providers []queryengine.ProviderConfig
+	ctx := context.Background()
+
+	if apiKey := os.Getenv("ANTHROPIC_API_KEY"); apiKey != "" {
+		defaultModel := os.Getenv("ANTHROPIC_MODEL")
+		if defaultModel == "" {
+			defaultModel = "claude-sonnet-4-20250514"
+		}
+		config := &provider.ClaudeConfig{
+			APIKey: apiKey,
+			Model:  defaultModel,
+			// Temperature: 0.7,
+		}
+		if baseURL := os.Getenv("ANTHROPIC_BASE_URL"); baseURL != "" {
+			config.BaseURL = baseURL
+		}
+
+		providerInst, err := provider.NewClaudeProvider(ctx, config)
+		if err != nil {
+			logger.DefaultLogger.Warn("Failed to create Claude provider", map[string]interface{}{"error": err.Error()})
+		} else if err := providerInst.Validate(ctx); err != nil {
+			logger.DefaultLogger.Warn("Claude provider validation failed", map[string]interface{}{"error": err.Error()})
+		} else {
+			providers = append(providers, queryengine.ProviderConfig{
+				Provider:     providerInst,
+				Models:       []string{"claude-sonnet-4-20250514", "claude-opus-4-7", "claude-opus-4-20250514", "claude-sonnet-4-7", "claude-haiku-4-7", defaultModel},
+				DefaultModel: defaultModel,
+			})
+			logger.DefaultLogger.Info("Claude provider registered")
+		}
+	}
+
+	if apiKey := os.Getenv("OPENAI_API_KEY"); apiKey != "" {
+		defaultModel := os.Getenv("OPENAI_MODEL")
+		if defaultModel == "" {
+			defaultModel = "gpt5.5"
+		}
+		config := &provider.OpenAIConfig{
+			APIKey:  apiKey,
+			Model:   defaultModel,
+			BaseURL: os.Getenv("OPENAI_BASE_URL"),
+		}
+
+		providerInst, err := provider.NewOpenAIProvider(ctx, config)
+		if err != nil {
+			logger.DefaultLogger.Warn("Failed to create OpenAI provider", map[string]interface{}{"error": err.Error()})
+		} else if err := providerInst.Validate(ctx); err != nil {
+			logger.DefaultLogger.Warn("OpenAI provider validation failed", map[string]interface{}{"error": err.Error()})
+		} else {
+			providers = append(providers, queryengine.ProviderConfig{
+				Provider:     providerInst,
+				Models:       []string{"gpt-5.5", defaultModel, "gpt-4o", "gpt-4o-mini", "gpt-4-turbo"},
+				DefaultModel: defaultModel,
+			})
+			logger.DefaultLogger.Info("OpenAI provider registered")
+		}
+	}
+
+	if apiKey := os.Getenv("DEEPSEEK_API_KEY"); apiKey != "" {
+		defaultModel := os.Getenv("DEEPSEEK_MODEL")
+		if defaultModel == "" {
+			defaultModel = "deepseek-chat"
+		}
+
+		providerInst, err := provider.NewDeepSeekProvider(ctx, apiKey, os.Getenv("DEEPSEEK_BASE_URL"))
+		if err != nil {
+			logger.DefaultLogger.Warn("Failed to create DeepSeek provider", map[string]interface{}{"error": err.Error()})
+		} else if err := providerInst.Validate(ctx); err != nil {
+			logger.DefaultLogger.Warn("DeepSeek provider validation failed", map[string]interface{}{"error": err.Error()})
+		} else {
+			providers = append(providers, queryengine.ProviderConfig{
+				Provider:     providerInst,
+				Models:       []string{defaultModel, "deepseek-chat", "deepseek-coder"},
+				DefaultModel: defaultModel,
+			})
+			logger.DefaultLogger.Info("DeepSeek provider registered")
+		}
+	}
+
+	if len(providers) == 0 {
+		mockProvider := provider.NewMockProvider()
+		providers = append(providers, queryengine.ProviderConfig{
+			Provider:     mockProvider,
+			Models:       []string{"mock"},
+			DefaultModel: "mock",
+		})
+		logger.DefaultLogger.Warn("No providers configured,using mock provider")
+
+	}
+
+	return providers
 
 }

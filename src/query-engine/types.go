@@ -139,6 +139,7 @@ type LLMProvider interface {
 	Name() string
 	Stream(params StreamParams) <-chan StreamEvent
 	CountTokens(message []Message, tools []ToolSchema, model string) (int, error)
+	Validate(ctx context.Context) error
 }
 
 func NewMessageWithContent(role MessageRole, content string) *Message {

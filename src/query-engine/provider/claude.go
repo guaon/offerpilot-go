@@ -167,17 +167,17 @@ func convertToMessages(messages []queryengine.Message) []*schema.Message {
 
 		switch msg.Role {
 		case queryengine.MessageRoleSystem:
-			if msg.Content != "" {
-				agenticMsg = schema.SystemMessage(msg.Content)
+			if msg.Content != nil {
+				agenticMsg = schema.SystemMessage(*msg.Content)
 			}
 		case queryengine.MessageRoleUser:
-			if msg.Content != "" {
-				agenticMsg = schema.UserMessage(msg.Content)
+			if msg.Content != nil {
+				agenticMsg = schema.UserMessage(*msg.Content)
 			}
 		case queryengine.MessageRoleAssistant:
-			if msg.ToolCalls != nil && len(msg.ToolCalls) > 0 {
-				toolCalls := make([]schema.ToolCall, 0, len(msg.ToolCalls))
-				for _, tc := range msg.ToolCalls {
+			if msg.ToolCalls != nil && len(*msg.ToolCalls) > 0 {
+				toolCalls := make([]schema.ToolCall, 0, len(*msg.ToolCalls))
+				for _, tc := range *msg.ToolCalls {
 					var argsJSON string
 					if tc.Input != nil {
 						argsBytes, _ := json.Marshal(tc.Input)
@@ -191,13 +191,13 @@ func convertToMessages(messages []queryengine.Message) []*schema.Message {
 						},
 					})
 				}
-				agenticMsg = schema.AssistantMessage(msg.Content, toolCalls)
-			} else if msg.Content != "" {
-				agenticMsg = schema.AssistantMessage(msg.Content, nil)
+				agenticMsg = schema.AssistantMessage(*msg.Content, toolCalls)
+			} else if msg.Content != nil {
+				agenticMsg = schema.AssistantMessage(*msg.Content, nil)
 			}
 		case queryengine.MessageRoleTool:
-			if msg.Content != "" && msg.ToolCallID != "" {
-				agenticMsg = schema.ToolMessage(msg.Content, msg.ToolCallID)
+			if msg.Content != nil && msg.ToolCallID != nil {
+				agenticMsg = schema.ToolMessage(*msg.Content, *msg.ToolCallID)
 			}
 		}
 
@@ -217,4 +217,13 @@ func mapStopReason(reason string) queryengine.StopReason {
 	default:
 		return queryengine.StopReasonEndTurn
 	}
+}
+
+func (p *ClaudeProvider) Validate(ctx context.Context) error {
+	testMsg := schema.UserMessage("ping")
+	_, err := p.chatModel.Generate(ctx, []*schema.Message{testMsg}, model.WithMaxTokens(1))
+	if err != nil {
+		return fmt.Errorf("claude validation failed: %w", err)
+	}
+	return nil
 }

@@ -142,9 +142,13 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID string, userMessage stri
 		}
 
 		params := queryengine.QueryParams{
-			Messages:        queryMessages,
-			Model:           &config.DefaultModel,
-			Tools:           al.convertToToolSchemaPtr(config.ToolRegistry.ListSchemas()),
+			Messages:  queryMessages,
+			Model:     &config.DefaultModel,
+			Tools:     al.convertToToolSchemaPtr(config.ToolRegistry.ListSchemas()),
+			MaxTokens: intPtr(4096),
+			// 0 means omit temperature. Claude models through the configured
+			// endpoint reject the deprecated temperature parameter.
+			Temperature:     float64Ptr(0),
 			SystemPrompt:    &systemPrompt,
 			OnTextDelta:     config.OnTextDelta,
 			OnThinkingDelta: config.OnThinkingDelta,
@@ -228,6 +232,14 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID string, userMessage stri
 
 	return finalText, nil
 
+}
+
+func intPtr(value int) *int {
+	return &value
+}
+
+func float64Ptr(value float64) *float64 {
+	return &value
 }
 
 func (al *AgentLoop) trackUsage(usage queryengine.TokenUsage) {

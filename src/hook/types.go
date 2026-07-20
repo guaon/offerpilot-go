@@ -39,7 +39,7 @@ type HookResult struct {
 
 type Hook interface {
 	Name() string
-	Staga() HookStage
+	Stage() HookStage
 	Priority() int
 	Execute(ctx HookContext) HookResult
 }

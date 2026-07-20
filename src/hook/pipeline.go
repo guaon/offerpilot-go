@@ -73,7 +73,7 @@ func (hp *HookPipeline) RunPostTool(ctx HookContext) *ToolResult {
 func (hp *HookPipeline) getHooks(stage HookStage) []Hook {
 	var result []Hook
 	for _, hook := range hp.hooks {
-		if hook.Staga() == stage {
+		if hook.Stage() == stage {
 			result = append(result, hook)
 		}
 	}
