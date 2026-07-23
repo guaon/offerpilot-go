@@ -107,7 +107,7 @@ func (ks *KnowledgeSearch) Search(opts SearchOptions) ([]*SearchResult, error) {
 
 }
 
-//直接通过关键词查找
+// 直接通过关键词查找
 func (ks *KnowledgeSearch) ftsSearch(query, dimension string, limit int) ([]*SearchResult, error) {
 	cleanQuery := regexp.MustCompile(`[^\w一-鿿\s]`).ReplaceAllString(query, " ") //将无效字符变为空格
 	terms := strings.Fields(cleanQuery)                                         //按空白字符分割字符串，返回单词切片。
@@ -174,8 +174,7 @@ func (ks *KnowledgeSearch) ftsSearch(query, dimension string, limit int) ([]*Sea
 
 }
 
-
-//通过向量搜索
+// 通过向量搜索
 func (ks *KnowledgeSearch) embeddingSearch(query, dimension string, limit int) ([]*SearchResult, error) {
 	if ks.embeddingProvider == nil {
 		return ks.likeFallback(query, dimension, limit)
@@ -281,7 +280,7 @@ func (ks *KnowledgeSearch) embeddingSearch(query, dimension string, limit int) (
 
 }
 
-//模糊查找
+// 模糊查找
 func (ks *KnowledgeSearch) likeFallback(query, dimension string, limit int) ([]*SearchResult, error) {
 	searchTerm := query
 	if len(searchTerm) > 20 {
@@ -326,10 +325,7 @@ func (ks *KnowledgeSearch) likeFallback(query, dimension string, limit int) ([]*
 	return results, rows.Err()
 }
 
-//知识条目生成向量嵌入并存储到数据库
-// chunkText splits text into chunks of approximately maxChars each.
-// It tries to split on paragraph and line boundaries first, then falls back to
-// hard-splitting by character count to ensure no chunk ever exceeds maxChars.
+// 长文本按照 maxChars 字符数分割成多个块（chunks），同时尽量保持段落和行的完整性
 func chunkText(text string, maxChars int) []string {
 	if len(text) <= maxChars {
 		return []string{text}
@@ -381,9 +377,9 @@ func chunkText(text string, maxChars int) []string {
 	return chunks
 }
 
-func (ks *KnowledgeSearch)IndexEmbeddings(ids []string)(int,error){
-	if ks.embeddingProvider==nil{
-		return 0,fmt.Errorf("no embedding provider configured")
+func (ks *KnowledgeSearch) IndexEmbeddings(ids []string) (int, error) {
+	if ks.embeddingProvider == nil {
+		return 0, fmt.Errorf("no embedding provider configured")
 
 	}
 
@@ -391,38 +387,38 @@ func (ks *KnowledgeSearch)IndexEmbeddings(ids []string)(int,error){
 	var sql string
 	var params []interface{}
 
-	if len(ids)>0{
-		placeholders:=make([]string,len(ids))
-		for i:=range placeholders{
-			placeholders[i]="?"
+	if len(ids) > 0 {
+		placeholders := make([]string, len(ids))
+		for i := range placeholders {
+			placeholders[i] = "?"
 		}
-		sql=`SELECT * FROM knowledge WHERE id IN(`+strings.Join(placeholders,",")+`)`
-		params=make([]interface{},len(ids))
-		for i,id:=range ids{
-			params[i]=id
+		sql = `SELECT * FROM knowledge WHERE id IN(` + strings.Join(placeholders, ",") + `)`
+		params = make([]interface{}, len(ids))
+		for i, id := range ids {
+			params[i] = id
 		}
 
-	}else{
-		sql=`SELECT * FROM knowledge WHERE id NOT IN (SELECT knowledge_id FROM embedding)`
+	} else {
+		sql = `SELECT * FROM knowledge WHERE id NOT IN (SELECT knowledge_id FROM embedding)`
 	}
 
-	rows,err:=ks.db.Query(sql,params...)
+	rows, err := ks.db.Query(sql, params...)
 
-	if err!=nil{
-		return 0,fmt.Errorf("query knowledge failed:%w",err)
+	if err != nil {
+		return 0, fmt.Errorf("query knowledge failed:%w", err)
 	}
 	defer rows.Close()
 
 	var entries []KnowledgeEntry
-	for rows.Next(){
-       var entry KnowledgeEntry
-	   if err:=ks.scanKnowledgeRow(rows,&entry);err!=nil{
-		return 0,fmt.Errorf("scan row failed:%w",err)
-	   }
-	   entries=append(entries, entry)
+	for rows.Next() {
+		var entry KnowledgeEntry
+		if err := ks.scanKnowledgeRow(rows, &entry); err != nil {
+			return 0, fmt.Errorf("scan row failed:%w", err)
+		}
+		entries = append(entries, entry)
 	}
-	if len(entries)==0{
-		return 0,nil
+	if len(entries) == 0 {
+		return 0, nil
 	}
 
 	//构建 (entry, chunkText) pairs，chunks 超长会被拆分
@@ -440,38 +436,38 @@ func (ks *KnowledgeSearch)IndexEmbeddings(ids []string)(int,error){
 	}
 
 	// 按 batchSize 分批 embed
-	batchSize:=100
+	batchSize := 100
 	var indexed int
 
-	for i:=0;i<len(pairs);i+=batchSize{
-		end:=i+batchSize
-		if end>len(pairs){
-			end=len(pairs)
+	for i := 0; i < len(pairs); i += batchSize {
+		end := i + batchSize
+		if end > len(pairs) {
+			end = len(pairs)
 		}
 
-		batch:=pairs[i:end]
-		texts:=make([]string,len(batch))
-		for j,p:=range batch{
-			texts[j]=p.chunk
+		batch := pairs[i:end]
+		texts := make([]string, len(batch))
+		for j, p := range batch {
+			texts[j] = p.chunk
 		}
 
-		vectors,err:=ks.embeddingProvider.EmbedBatch(texts)
-		if err!=nil{
-			return indexed,fmt.Errorf("embed batch failed:%w",err)
+		vectors, err := ks.embeddingProvider.EmbedBatch(texts)
+		if err != nil {
+			return indexed, fmt.Errorf("embed batch failed:%w", err)
 		}
 
-		tx,err:=ks.db.Begin()
-		if err!=nil{
-			return indexed,fmt.Errorf("begin transaction failed:%w",err)
+		tx, err := ks.db.Begin()
+		if err != nil {
+			return indexed, fmt.Errorf("begin transaction failed:%w", err)
 		}
 
-		stmt,err:=tx.Prepare(`
+		stmt, err := tx.Prepare(`
 			INSERT OR REPLACE INTO embedding (knowledge_id,chunk_index,vector,model,created_at)
 			VALUES(?,?,?,?,strftime('%s','now'))
 		`)
-		if err!=nil{
+		if err != nil {
 			tx.Rollback()
-			return indexed,fmt.Errorf("prepare statement failed:%w",err)
+			return indexed, fmt.Errorf("prepare statement failed:%w", err)
 		}
 
 		// assign sequential indices within the batch
@@ -484,14 +480,14 @@ func (ks *KnowledgeSearch)IndexEmbeddings(ids []string)(int,error){
 				return indexed, fmt.Errorf("exec statement failed:%w", err)
 			}
 		}
-		if err:=tx.Commit();err!=nil{
-			return indexed,fmt.Errorf("commit transaction failed :%w",err)
+		if err := tx.Commit(); err != nil {
+			return indexed, fmt.Errorf("commit transaction failed :%w", err)
 		}
 
-		indexed+=len(vectors)
+		indexed += len(vectors)
 
 	}
-	return indexed,nil
+	return indexed, nil
 
 }
 

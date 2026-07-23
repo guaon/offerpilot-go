@@ -1,9 +1,12 @@
 package server
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"html"
 	"io"
@@ -18,6 +21,8 @@ import (
 	"MyOfferPilot/src/app"
 	"MyOfferPilot/src/logger"
 	"MyOfferPilot/src/realtime"
+
+	pdfreader "github.com/ledongthuc/pdf"
 )
 
 //go:embed web/*
@@ -86,6 +91,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/_next/", s.handleStaticFile)
 	mux.HandleFunc("/brand/", s.handleStaticFile)
+	mux.HandleFunc("/upload", s.handleUploadPage)
+	mux.HandleFunc("/upload.js", s.handleUploadJS)
 	mux.HandleFunc("/", s.handleStaticOrSPA)
 
 	s.httpServer = &http.Server{
@@ -1451,8 +1458,18 @@ func (s *Server) handleParsePDF(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	err := req.ParseMultipartForm(10 << 20)
-	if err != nil {
+	// Recover from any panic in the parser so the connection survives
+	// a malformed/encrypted/corrupt file instead of being torn down.
+	defer func() {
+		if r := recover(); r != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": fmt.Sprintf("Failed to parse file: %v", r),
+			})
+		}
+	}()
+
+	if err := req.ParseMultipartForm(10 << 20); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to parse form"})
 		return
@@ -1475,59 +1492,165 @@ func (s *Server) handleParsePDF(w http.ResponseWriter, req *http.Request) {
 
 	filename := strings.ToLower(handler.Filename)
 
-	if strings.HasSuffix(filename, ".pdf") {
-		text := extractTextFromPDF(data)
+	switch {
+	case strings.HasSuffix(filename, ".pdf"):
+		text, pages, err := extractTextFromPDF(data)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "PDF parse failed: " + err.Error()})
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{"text": text, "pages": nil, "format": "pdf"})
-		return
-	}
+		json.NewEncoder(w).Encode(map[string]interface{}{"text": text, "pages": pages, "format": "pdf"})
 
-	if strings.HasSuffix(filename, ".docx") || strings.HasSuffix(filename, ".doc") {
-		text := extractTextFromDocx(data)
+	case strings.HasSuffix(filename, ".docx"):
+		text, err := extractTextFromDocx(data)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "DOCX parse failed: " + err.Error()})
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{"text": text, "pages": nil, "format": "docx"})
-		return
-	}
 
-	if strings.HasSuffix(filename, ".tex") {
+	case strings.HasSuffix(filename, ".tex"):
 		text := stripLatex(string(data))
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{"text": text, "pages": nil, "format": "tex"})
-		return
-	}
 
-	if strings.HasSuffix(filename, ".txt") || strings.HasSuffix(filename, ".md") {
+	case strings.HasSuffix(filename, ".txt"), strings.HasSuffix(filename, ".md"):
 		text := string(data)
 		format := "txt"
 		if strings.HasSuffix(filename, ".md") {
 			format = "md"
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{"text": text, "pages": nil, "format": format})
-		return
+
+	default:
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Unsupported file format"})
+	}
+}
+
+// extractTextFromPDF uses ledongthuc/pdf to pull real text from each page.
+// It returns the joined text and the page count. Failures (encrypted,
+// malformed, empty) are reported via error so the caller can answer 400.
+func extractTextFromPDF(data []byte) (string, int, error) {
+	if len(data) == 0 {
+		return "", 0, fmt.Errorf("empty file")
 	}
 
-	w.WriteHeader(http.StatusBadRequest)
-	json.NewEncoder(w).Encode(map[string]string{"error": "Unsupported file format"})
+	reader, err := pdfreader.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return "", 0, fmt.Errorf("open pdf: %w", err)
+	}
+
+	totalPages := reader.NumPage()
+	var b strings.Builder
+	for i := 1; i <= totalPages; i++ {
+		page := reader.Page(i)
+		text, err := page.GetPlainText(nil)
+		if err != nil {
+			return "", totalPages, fmt.Errorf("read page %d: %w", i, err)
+		}
+		b.WriteString(text)
+		b.WriteString("\n\n")
+	}
+
+	text := normalizeExtractedText(b.String())
+	if strings.TrimSpace(text) == "" {
+		return "", totalPages, fmt.Errorf("no extractable text (scanned/encrypted PDF?)")
+	}
+	return text, totalPages, nil
 }
 
-func extractTextFromPDF(data []byte) string {
-	text := string(data)
-	text = regexp.MustCompile(`/T\(([^)]+)\)`).ReplaceAllString(text, "$1 ")
-	text = regexp.MustCompile(`<[^>]+>`).ReplaceAllString(text, "")
-	text = regexp.MustCompile(`[^\x20-\x7E\u4E00-\u9FFF\n]`).ReplaceAllString(text, "")
-	text = regexp.MustCompile(`\n{3,}`).ReplaceAllString(text, "\n\n")
-	return strings.TrimSpace(text)
+// extractTextFromDocx reads word/document.xml from the docx zip and joins
+// all <w:t> runs in document order. Headings become their own paragraphs.
+func extractTextFromDocx(data []byte) (string, error) {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return "", fmt.Errorf("open docx zip: %w", err)
+	}
+
+	var docFile *zip.File
+	for _, f := range zr.File {
+		if f.Name == "word/document.xml" {
+			docFile = f
+			break
+		}
+	}
+	if docFile == nil {
+		return "", fmt.Errorf("word/document.xml not found")
+	}
+
+	rc, err := docFile.Open()
+	if err != nil {
+		return "", fmt.Errorf("open document.xml: %w", err)
+	}
+	defer rc.Close()
+
+	type wT struct {
+		XMLName xml.Name `xml:"w:t"`
+		Space   string   `xml:"xml:space,attr"`
+		Text    string   `xml:",chardata"`
+	}
+	type wP struct {
+		XMLName xml.Name `xml:"w:p"`
+		Texts   []wT     `xml:"w:r>w:t"`
+	}
+
+	dec := xml.NewDecoder(rc)
+	var (
+		out       strings.Builder
+		inPara    bool
+		paraStart = false
+	)
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("decode xml: %w", err)
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "p":
+				inPara = true
+				paraStart = true
+			case "t":
+				if inPara {
+					var wt wT
+					if err := dec.DecodeElement(&wt, &t); err != nil {
+						return "", fmt.Errorf("decode w:t: %w", err)
+					}
+					if paraStart && out.Len() > 0 {
+						out.WriteString("\n")
+					}
+					paraStart = false
+					out.WriteString(wt.Text)
+				}
+			}
+		case xml.EndElement:
+			if t.Name.Local == "p" {
+				inPara = false
+				out.WriteString("\n")
+			}
+		}
+	}
+
+	text := normalizeExtractedText(out.String())
+	if strings.TrimSpace(text) == "" {
+		return "", fmt.Errorf("no extractable text in docx")
+	}
+	return text, nil
 }
 
-func extractTextFromDocx(data []byte) string {
-	text := string(data)
-	text = regexp.MustCompile(`<w:t>([^<]+)</w:t>`).ReplaceAllString(text, "$1")
-	text = regexp.MustCompile(`<[^>]+>`).ReplaceAllString(text, "")
+func normalizeExtractedText(text string) string {
+	// Collapse runs of blank lines that PDFs often emit between pages.
+	text = regexp.MustCompile(`[ \t]+\n`).ReplaceAllString(text, "\n")
 	text = regexp.MustCompile(`\n{3,}`).ReplaceAllString(text, "\n\n")
 	return strings.TrimSpace(text)
 }
@@ -1720,3 +1843,181 @@ func getContentType(ext string) string {
 		return "application/octet-stream"
 	}
 }
+
+// handleUploadPage serves a small diagnostic page that exercises the
+// /api/parse-pdf and /api/resume endpoints end-to-end. Useful when the
+// Next.js frontend hasn't yet wired up the upload UI.
+func (s *Server) handleUploadPage(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(uploadPageHTML))
+}
+
+func (s *Server) handleUploadJS(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(uploadPageJS))
+}
+
+const uploadPageHTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>简历上传调试 · OfferPilot</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<link rel="stylesheet" href="/style.css"/>
+<style>
+.upload-wrap{max-width:760px;margin:0 auto;padding:32px 24px;overflow:auto}
+.upload-card{border:1px solid var(--line);border-radius:var(--radius);background:var(--card);padding:28px;box-shadow:var(--shadow)}
+.upload-card h1{margin:0 0 8px;font-size:24px}
+.upload-card p.sub{color:var(--text-soft);margin:0 0 20px;font-size:14px}
+.drop-zone{border:2px dashed var(--line);border-radius:12px;padding:32px 16px;text-align:center;color:var(--text-soft);transition:all .15s;cursor:pointer;background:#fafaf9}
+.drop-zone:hover,.drop-zone.drag{border-color:var(--accent);background:var(--accent-soft);color:var(--accent-strong)}
+.drop-zone input{display:none}
+.btn{padding:9px 18px;border-radius:10px;background:var(--accent);color:#fff;border:0;cursor:pointer;font-size:14px;font-weight:500;transition:background .15s}
+.btn:hover{background:var(--accent-strong)}
+.btn:disabled{background:var(--text-faint);cursor:not-allowed}
+.btn.secondary{background:#fff;color:var(--text);border:1px solid var(--line)}
+.btn.secondary:hover{border-color:var(--accent);color:var(--accent-strong)}
+.row{display:flex;gap:10px;align-items:center;margin-top:16px;flex-wrap:wrap}
+.meta{font-size:12.5px;color:var(--text-faint);margin-top:8px}
+textarea#extracted{width:100%;min-height:240px;border:1px solid var(--line);border-radius:10px;padding:12px;font:13px ui-monospace,Consolas,monospace;resize:vertical;background:#fafaf9}
+.section{margin-top:24px}
+.section h3{margin:0 0 10px;font-size:15px}
+.diag-item{border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:10px;background:#fff}
+.diag-item .head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font-weight:600}
+.score-pill{padding:2px 10px;border-radius:999px;background:var(--accent-soft);color:var(--accent-strong);font-size:12px;font-weight:600}
+.issues{color:#b91c1c;font-size:13px;margin:4px 0}
+.suggestions{color:var(--text-soft);font-size:13px}
+.err{color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;padding:10px 12px;border-radius:8px;margin-top:12px;font-size:13px}
+.toast{position:fixed;top:20px;right:20px;padding:10px 16px;border-radius:10px;background:#1c1917;color:#fff;font-size:13px;opacity:0;transform:translateY(-8px);transition:all .2s;z-index:50}
+.toast.show{opacity:1;transform:none}
+</style>
+</head>
+<body>
+<div class="topbar"><div class="topbar-inner">
+  <div class="brand"><div class="brand-mark">OP</div><div class="brand-name">OfferPilot · 简历上传调试</div></div>
+  <div class="topbar-right"><a class="login-btn" href="/" style="text-decoration:none">返回主页</a></div>
+</div></div>
+
+<div class="upload-wrap">
+  <div class="upload-card">
+    <h1>上传简历 → 自动解析 → 诊断</h1>
+    <p class="sub">支持 PDF / DOCX / TXT / MD / TEX。先解析得到文本，再调用 <code>/api/resume</code> 跑诊断。</p>
+
+    <label class="drop-zone" id="dropZone">
+      <input type="file" id="fileInput" accept=".pdf,.docx,.doc,.txt,.md,.tex"/>
+      <div>📄 点击或拖拽简历到这里</div>
+      <div class="meta">最大 10MB</div>
+    </label>
+
+    <div class="row">
+      <button class="btn" id="parseBtn" disabled>1. 解析文件</button>
+      <button class="btn secondary" id="diagnoseBtn" disabled>2. 跑诊断</button>
+      <span class="meta" id="fileMeta"></span>
+    </div>
+
+    <div id="parseErr" class="err hidden"></div>
+
+    <div class="section">
+      <h3>提取的文本 <span class="meta" id="textMeta"></span></h3>
+      <textarea id="extracted" placeholder="解析后会显示在这里..."></textarea>
+    </div>
+
+    <div class="section">
+      <h3>诊断结果</h3>
+      <div id="diagnosis"></div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="/upload.js"></script>
+</body>
+</html>`
+
+const uploadPageJS = `
+var fileInput = document.getElementById('fileInput');
+var dropZone = document.getElementById('dropZone');
+var parseBtn = document.getElementById('parseBtn');
+var diagnoseBtn = document.getElementById('diagnoseBtn');
+var fileMeta = document.getElementById('fileMeta');
+var textMeta = document.getElementById('textMeta');
+var extracted = document.getElementById('extracted');
+var diagnosis = document.getElementById('diagnosis');
+var parseErr = document.getElementById('parseErr');
+var toast = document.getElementById('toast');
+var currentText = '';
+
+function toastMsg(msg){toast.textContent=msg;toast.classList.add('show');setTimeout(function(){toast.classList.remove('show');},1800);}
+
+function setFile(f){
+  if(!f) return;
+  if(f.size>10*1024*1024){parseErr.textContent='文件超过 10MB';parseErr.classList.remove('hidden');return;}
+  parseErr.classList.add('hidden');
+  currentFile=f;
+  fileMeta.textContent=f.name+' · '+Math.round(f.size/1024)+' KB';
+  parseBtn.disabled=false;
+  diagnoseBtn.disabled=true;
+  extracted.value='';
+  diagnosis.innerHTML='';
+  textMeta.textContent='';
+}
+
+fileInput.addEventListener('change',function(e){setFile(e.target.files[0]);});
+['dragenter','dragover'].forEach(function(ev){dropZone.addEventListener(ev,function(e){e.preventDefault();dropZone.classList.add('drag');});});
+['dragleave','drop'].forEach(function(ev){dropZone.addEventListener(ev,function(e){e.preventDefault();dropZone.classList.remove('drag');});});
+dropZone.addEventListener('drop',function(e){if(e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]);});
+
+parseBtn.addEventListener('click',async function(){
+  if(!currentFile) return;
+  parseBtn.disabled=true;parseBtn.textContent='解析中...';
+  parseErr.classList.add('hidden');
+  var fd=new FormData();fd.append('file',currentFile);
+  try{
+    var res=await fetch('/api/parse-pdf',{method:'POST',body:fd,credentials:'include'});
+    var data=await res.json();
+    if(!res.ok) throw new Error(data.error||('HTTP '+res.status));
+    currentText=data.text||'';
+    extracted.value=currentText;
+    textMeta.textContent=(data.pages?' · '+data.pages+' 页':'')+' · '+data.format+' · '+currentText.length+' 字';
+    toastMsg('解析成功');
+    diagnoseBtn.disabled=!currentText.trim();
+  }catch(e){
+    parseErr.textContent='解析失败: '+e.message;
+    parseErr.classList.remove('hidden');
+  }finally{
+    parseBtn.disabled=false;parseBtn.textContent='1. 解析文件';
+  }
+});
+
+diagnoseBtn.addEventListener('click',async function(){
+  if(!currentText.trim()) return;
+  diagnoseBtn.disabled=true;diagnoseBtn.textContent='诊断中...';
+  diagnosis.innerHTML='';
+  try{
+    var res=await fetch('/api/resume',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify({content:currentText})});
+    var data=await res.json();
+    if(!res.ok) throw new Error(data.error||('HTTP '+res.status));
+    renderDiagnosis(data.diagnosis||[]);
+    toastMsg('诊断完成');
+  }catch(e){
+    diagnosis.innerHTML='<div class="err">诊断失败: '+e.message+'</div>';
+  }finally{
+    diagnoseBtn.disabled=false;diagnoseBtn.textContent='2. 跑诊断';
+  }
+});
+
+function renderDiagnosis(items){
+  if(!items.length){diagnosis.innerHTML='<div class="meta">没有发现问题，干得漂亮 🎉</div>';return;}
+  diagnosis.innerHTML=items.map(function(it){
+    return '<div class="diag-item">'
+      +'<div class="head"><span>'+(it.section||'(未命名段落)')+'</span><span class="score-pill">'+it.score+'/10</span></div>'
+      +(it.issues&&it.issues.length?'<div class="issues">⚠ '+escapeHtml(it.issues.join(' · '))+'</div>':'')
+      +'<div class="suggestions">💡 '+escapeHtml((it.suggestions||[]).join(' · '))+'</div>'
+      +'</div>';
+  }).join('');
+}
+
+function escapeHtml(s){return (s||'').replace(/[&<>\"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+`

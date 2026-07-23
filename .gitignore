@@ -1,0 +1,44 @@
+# 编译产物
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go 编译缓存
+work/
+*.test
+go.work
+go.work.sum
+
+# 数据库文件
+*.db
+*.sqlite
+
+# 日志文件
+*.log
+server_out.log
+
+# 二进制文件
+offerpilot.exe
+main.exe
+data/offerpilot.exe
+
+# IDE 配置
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.bak
+*~
+
+# 环境变量文件（重要：不要提交 API Key）
+.env
+.env.local
+.env.*.local
