@@ -32,7 +32,7 @@ func WithRetry(fn func() error, opts *RetryOptions) error {
 	maxDelay := defaultMaxDelay
 
 	if opts != nil {
-		if opts.MaxDelay > 0 {
+		if opts.MaxRetries > 0 {
 			maxRetries = opts.MaxRetries
 		}
 		if opts.BaseDelay > 0 {

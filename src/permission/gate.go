@@ -44,12 +44,12 @@ func (pg *PermissionGate) Check(toolName string, riskLevel RiskLevel, sessionID 
 
 		tracker := pg.callCounts[key]
 		if tracker != nil && now-tracker.windowStart < 60000 {
-			//// 在60秒窗口内
-			if tracker.count >= rule.RateLimitPerMinute {
-				//// 超过限制，拒绝
+			// 在60秒窗口内，先增加计数再检查是否超限
+			tracker.count++
+			if tracker.count > rule.RateLimitPerMinute {
+				// 超过限制，拒绝（注意计数已经+1，用户实际可以到达 RateLimitPerMinute 次）
 				return PermissionDecision{Allowed: false, Reason: "Rate limit exceeded"}
 			}
-			tracker.count++
 		} else {
 			pg.callCounts[key] = &callTracker{count: 1, windowStart: now}
 		}

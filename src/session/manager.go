@@ -366,9 +366,7 @@ func (sm *SessionManager) loadFromDB() error {
 		if err != nil {
 			return fmt.Errorf("query messages failed:%w", err)
 		}
-		if err != nil {
-			return fmt.Errorf("query messages failed:%w", err)
-		}
+		defer msgRows.Close()
 		for msgRows.Next() {
 			var role, content, toolCallID, toolCallsJSON string
 			if err := msgRows.Scan(&role, &content, &toolCallID, &toolCallsJSON); err != nil {

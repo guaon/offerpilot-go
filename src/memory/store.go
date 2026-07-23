@@ -48,15 +48,15 @@ func NewMemoryStore(dpPath string) (*MemoryStore, error) {
 
 func createMemoryTable(db *sql.DB) error {
 	query := `
-    CREATE TABLE IF NOT EXISTS memories(
+	CREATE TABLE IF NOT EXISTS memories(
 	    id TEXT PRIMARY KEY,
 		session_id TEXT NOT NULL,
 		type TEXT NOT NULL,
         content TEXT NOT NULL,
-		importance REAL NOT NOLL,
+		importance REAL NOT NULL,
 		access_count INTEGER NOT NULL DEFAULT 0,
 		create_at INTEGER NOT NULL,
-		last_accessed_at INTEGER NOT NULL,
+		last_accessed_at INTEGER NOT NULL
 
 	);
 
@@ -87,7 +87,7 @@ func (s *MemoryStore) Add(entry MemoryEntry) *MemoryEntry {
 	if s.db != nil {
 		s.db.Exec(`
 		   INSERT INTO memories(id,session_id,type,content,importance,access_count,create_at,last_accessed_at)
-		   VALUE(?,?,?,?,?,?,?,?)
+		   VALUES(?,?,?,?,?,?,?,?)
 		`, full.ID, full.SessionID, full.Type, full.Content, full.Importance, 0, full.CreateAt, full.LastAccessedAt)
 	}
 
@@ -97,7 +97,7 @@ func (s *MemoryStore) Add(entry MemoryEntry) *MemoryEntry {
 func (s *MemoryStore) Query(q MemoryQuery) []*MemoryEntry {
 	results := make([]*MemoryEntry, 0, len(s.entries))
 	for _, e := range s.entries {
-		if q.SessionID != "" && e.SessionID == q.SessionID {
+		if q.SessionID != "" && e.SessionID != q.SessionID {
 			continue
 		}
 		if q.Type != "" && e.Type != q.Type {

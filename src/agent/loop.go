@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"strings"
+	"time"
 
 	appcontext "MyOfferPilot/src/context"
 	hooks "MyOfferPilot/src/hook"
@@ -114,7 +115,7 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID string, userMessage stri
 
 	messages, err := config.SessionManager.GetMessages(sessionID)
 	if err != nil {
-		return "", nil
+		return "", err
 	}
 
 	queryMessages := al.convertToQueryEngineMessages(messages)
@@ -131,6 +132,13 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID string, userMessage stri
 		if config.MaxBudgetTokens > 0 && al.usage.TotalTokens >= config.MaxBudgetTokens {
 			break
 		}
+
+		log.Info("AI iteration started", map[string]interface{}{
+			"sessionID":  sessionID,
+			"iteration":  i + 1,
+			"totalTokens": al.usage.TotalTokens,
+			"component":  "AgentLoop",
+		})
 
 		compressed := config.ContextManager.Compress(queryMessages, 0)
 		if compressed.Level != appcontext.CompressionLevelNone {
@@ -174,6 +182,20 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID string, userMessage stri
 		}
 
 		if response.Type == "tool_use" && response.ToolCalls != nil && len(*response.ToolCalls) > 0 {
+			log.Info("AI requesting tool calls", map[string]interface{}{
+				"sessionID":   sessionID,
+				"iteration":   i + 1,
+				"toolCount":   len(*response.ToolCalls),
+				"toolNames":   getToolNames(*response.ToolCalls),
+				"component":   "AgentLoop",
+			})
+
+			if config.OnToolCall != nil {
+				for _, tc := range *response.ToolCalls {
+					config.OnToolCall(tc.Name, tc.Input)
+				}
+			}
+
 			var toolCalls []schema.ToolCall
 			for _, tc := range *response.ToolCalls {
 				toolCalls = append(toolCalls, schema.ToolCall{
@@ -191,7 +213,26 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID string, userMessage stri
 			}
 
 			messages = append(messages, assistantMsg)
-			queryMessages = append(queryMessages, *queryengine.NewMessageWithContent(queryengine.MessageRoleAssistant, ""))
+
+			// Build query engine message with tool_calls preserved
+			qeToolCalls := make([]queryengine.ToolCall, 0, len(toolCalls))
+			for _, tc := range toolCalls {
+				var input map[string]interface{}
+				if tc.Function.Arguments != "" {
+					_ = json.Unmarshal([]byte(tc.Function.Arguments), &input)
+				}
+				qeToolCalls = append(qeToolCalls, queryengine.ToolCall{
+					ID:    tc.ID,
+					Name:  tc.Function.Name,
+					Input: input,
+				})
+			}
+			emptyContent := ""
+			queryMessages = append(queryMessages, queryengine.Message{
+				Role:      queryengine.MessageRoleAssistant,
+				Content:   &emptyContent,
+				ToolCalls: &qeToolCalls,
+			})
 
 			for _, toolCall := range *response.ToolCalls {
 				result, err := al.executeTool(ctx, toolCall, sessionID)
@@ -204,7 +245,12 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID string, userMessage stri
 					return "", err
 				}
 				messages = append(messages, toolMsg)
-				queryMessages = append(queryMessages, *queryengine.NewMessageWithContent(queryengine.MessageRoleTool, result.Output))
+				id := toolCall.ID
+				queryMessages = append(queryMessages, queryengine.Message{
+					Role:       queryengine.MessageRoleTool,
+					Content:    &result.Output,
+					ToolCallID: &id,
+				})
 			}
 
 		}
@@ -250,32 +296,68 @@ func (al *AgentLoop) trackUsage(usage queryengine.TokenUsage) {
 }
 
 func (al *AgentLoop) executeTool(ctx context.Context, toolCall queryengine.ToolCall, sessionID string) (*tool.ToolResult, error) {
-	logger.DefaultLogger.Debug("Executing tool", map[string]interface{}{
-		"tool": toolCall.Name,
+	log := logger.DefaultLogger
+
+	log.Info("Tool call started", map[string]interface{}{
+		"sessionID":  sessionID,
+		"toolName":   toolCall.Name,
+		"toolInput":  formatToolInput(toolCall.Input),
+		"component":  "AgentLoop",
 	})
 
 	toolDef := al.config.ToolRegistry.Get(toolCall.Name)
 	if toolDef == nil {
+		log.Warn("Tool not found in registry", map[string]interface{}{
+			"sessionID": sessionID,
+			"toolName":  toolCall.Name,
+			"component": "AgentLoop",
+		})
 		return nil, nil
 	}
 
 	riskLevel := permission.RiskLevel(toolDef.RiskLevel)
 	decisionResult := al.config.PermissionGate.Check(toolCall.Name, riskLevel, sessionID)
 	if !decisionResult.Allowed {
+		log.Warn("Tool permission denied", map[string]interface{}{
+			"sessionID":  sessionID,
+			"toolName":   toolCall.Name,
+			"riskLevel":  riskLevel,
+			"reason":     decisionResult.Reason,
+			"component":  "AgentLoop",
+		})
 		return &tool.ToolResult{
 			Success: false,
 			Output:  "Permission denied",
 		}, nil
 	}
 
+	if decisionResult.RequiredUserConfirm {
+		log.Info("Tool requires user confirmation", map[string]interface{}{
+			"sessionID": sessionID,
+			"toolName":  toolCall.Name,
+			"riskLevel": riskLevel,
+			"component": "AgentLoop",
+		})
+	}
+
 	inputJSON, _ := json.Marshal(toolCall.Input)
 
+	startTime := time.Now()
 	result, err := al.config.ToolRegistry.ExecuteJSON(ctx, toolCall.Name, string(inputJSON), tool.ToolContext{
 		SessionId:   sessionID,
 		UserID:      "",
 		AgentConfig: al.config,
 	})
+	elapsed := time.Since(startTime)
+
 	if err != nil {
+		log.Error("Tool execution failed", map[string]interface{}{
+			"sessionID": sessionID,
+			"toolName":  toolCall.Name,
+			"error":     err.Error(),
+			"duration":  elapsed.String(),
+			"component": "AgentLoop",
+		})
 		return &tool.ToolResult{
 			Success: false,
 			Output:  err.Error(),
@@ -284,7 +366,7 @@ func (al *AgentLoop) executeTool(ctx context.Context, toolCall queryengine.ToolC
 
 	decision := "allowed"
 	if decisionResult.RequiredUserConfirm {
-		decision = "comfirmed"
+		decision = "confirmed"
 	}
 
 	al.config.PermissionGate.RecordAudit(permission.AuditEntry{
@@ -300,9 +382,13 @@ func (al *AgentLoop) executeTool(ctx context.Context, toolCall queryengine.ToolC
 		al.config.OnToolResult(toolCall.Name, result.Output)
 	}
 
-	logger.DefaultLogger.Debug("tool executed", map[string]interface{}{
-		"tool":    toolCall.Name,
-		"success": result.Success,
+	log.Info("Tool execution completed", map[string]interface{}{
+		"sessionID": sessionID,
+		"toolName":  toolCall.Name,
+		"success":   result.Success,
+		"duration":  elapsed.String(),
+		"outputLen": len(result.Output),
+		"component": "AgentLoop",
 	})
 
 	return result, nil
@@ -318,9 +404,29 @@ func (al *AgentLoop) convertToQueryEngineMessages(messages []*schema.Message) []
 		case schema.User:
 			result = append(result, *queryengine.NewMessageWithContent(queryengine.MessageRoleUser, msg.Content))
 		case schema.Assistant:
-			result = append(result, *queryengine.NewMessageWithContent(queryengine.MessageRoleAssistant, msg.Content))
+			if msg.ToolCalls != nil && len(msg.ToolCalls) > 0 {
+				toolCalls := make([]queryengine.ToolCall, 0, len(msg.ToolCalls))
+				for _, tc := range msg.ToolCalls {
+					toolCalls = append(toolCalls, queryengine.ToolCall{
+						ID:   tc.ID,
+						Name: tc.Function.Name,
+						Input: nil,
+					})
+				}
+				result = append(result, queryengine.Message{
+					Role:      queryengine.MessageRoleAssistant,
+					Content:   &msg.Content,
+					ToolCalls: &toolCalls,
+				})
+			} else {
+				result = append(result, *queryengine.NewMessageWithContent(queryengine.MessageRoleAssistant, msg.Content))
+			}
 		case schema.Tool:
-			result = append(result, *queryengine.NewMessageWithContent(queryengine.MessageRoleTool, msg.Content))
+			result = append(result, queryengine.Message{
+				Role:       queryengine.MessageRoleTool,
+				Content:    &msg.Content,
+				ToolCallID: &msg.ToolCallID,
+			})
 		}
 	}
 
@@ -356,12 +462,60 @@ func (al *AgentLoop) convertFromQueryEngineMessages(messages []queryengine.Messa
 func (al *AgentLoop) convertToToolSchemaPtr(tools []*schema.ToolInfo) *[]queryengine.ToolSchema {
 	result := make([]queryengine.ToolSchema, 0, len(tools))
 	for _, t := range tools {
+		params := buildJSONSchemaFromParams(t.ParamsOneOf)
 		result = append(result, queryengine.ToolSchema{
 			Name:        t.Name,
-			Description: "",
-			Parameters:  make(map[string]interface{}),
+			Description: t.Desc,
+			Parameters:  params,
 		})
 	}
 
 	return &result
+}
+
+func buildJSONSchemaFromParams(p *schema.ParamsOneOf) map[string]interface{} {
+	if p == nil {
+		return nil
+	}
+
+	jsonSchema, err := p.ToJSONSchema()
+	if err != nil || jsonSchema == nil {
+		return nil
+	}
+
+	// Marshal to JSON then unmarshal to map
+	data, err := json.Marshal(jsonSchema)
+	if err != nil {
+		return nil
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil
+	}
+
+	return result
+}
+
+func getToolNames(toolCalls []queryengine.ToolCall) []string {
+	names := make([]string, len(toolCalls))
+	for i, tc := range toolCalls {
+		names[i] = tc.Name
+	}
+	return names
+}
+
+func formatToolInput(input map[string]interface{}) string {
+	if input == nil {
+		return "{}"
+	}
+	b, err := json.Marshal(input)
+	if err != nil {
+		return "{}"
+	}
+	s := string(b)
+	if len(s) > 500 {
+		return s[:500] + "...(truncated)"
+	}
+	return s
 }

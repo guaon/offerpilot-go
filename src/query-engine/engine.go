@@ -3,6 +3,10 @@ package queryengine
 import (
 	"context"
 	"errors"
+	"strings"
+	"time"
+
+	"MyOfferPilot/src/logger"
 )
 
 type QueryEngineOptions struct {
@@ -30,6 +34,8 @@ func NewQueryEngine(opts QueryEngineOptions) *QueryEngine {
 
 //找对的AI、处理流式回复、自动重试，最后给出完整的答案
 func (qe *QueryEngine) Query(params QueryParams) (ParsedResponse, error) {
+	log := logger.DefaultLogger
+
 	model := ""
 	if params.Model != nil {
 		model = *params.Model
@@ -56,6 +62,17 @@ func (qe *QueryEngine) Query(params QueryParams) (ParsedResponse, error) {
 		systemPrompt = *params.SystemPrompt
 	}
 
+	log.Info("QueryEngine processing request", map[string]interface{}{
+		"model":         result.Model,
+		"provider":      result.Provider.Name(),
+		"messageCount": len(params.Messages),
+		"toolCount":    len(tools),
+		"maxTokens":    maxTokens,
+		"component":    "QueryEngine",
+	})
+
+	startTime := time.Now()
+
 	return WithRetryResult(func() (ParsedResponse, error) {
 		collector := NewStreamCollector()
 
@@ -71,6 +88,10 @@ func (qe *QueryEngine) Query(params QueryParams) (ParsedResponse, error) {
 		for event := range stream {
 			if errorEvent, ok := event.(*ErrorEvent); ok {
 				if errorEvent.Err != nil {
+					log.Error("QueryEngine stream error", map[string]interface{}{
+						"error":     errorEvent.Err.Error(),
+						"component": "QueryEngine",
+					})
 					return ParsedResponse{}, errorEvent.Err
 				}
 				return ParsedResponse{}, errors.New("model stream returned an unknown error")
@@ -88,7 +109,41 @@ func (qe *QueryEngine) Query(params QueryParams) (ParsedResponse, error) {
 
 		}
 
-		return collector.Result(), nil
+		result := collector.Result()
+		elapsed := time.Since(startTime)
+
+		log.Info("QueryEngine request completed", map[string]interface{}{
+			"responseType": result.Type,
+			"duration":     elapsed.String(),
+			"inputTokens":  result.Usage.InputTokens,
+			"outputTokens": result.Usage.OutputTokens,
+			"component":    "QueryEngine",
+		})
+
+		if result.Type == "tool_use" && result.ToolCalls != nil {
+			toolNames := make([]string, len(*result.ToolCalls))
+			for i, tc := range *result.ToolCalls {
+				toolNames[i] = tc.Name
+			}
+			log.Info("QueryEngine returning tool calls", map[string]interface{}{
+				"toolCount": len(*result.ToolCalls),
+				"toolNames": strings.Join(toolNames, ", "),
+				"component": "QueryEngine",
+			})
+		} else if result.Type == "text" && result.Content != nil {
+			content := *result.Content
+			preview := content
+			if len(content) > 200 {
+				preview = content[:200] + "..."
+			}
+			log.Info("QueryEngine returning text response", map[string]interface{}{
+				"contentLength": len(content),
+				"contentPreview": preview,
+				"component":    "QueryEngine",
+			})
+		}
+
+		return result, nil
 	}, qe.retryOpts)
 }
 

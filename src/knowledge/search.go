@@ -9,6 +9,17 @@ import (
 	"strings"
 )
 
+func NewKnowledgeSearchFromFile(dbPath string) *KnowledgeSearch {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil
+	}
+	if err := db.Ping(); err != nil {
+		return nil
+	}
+	return &KnowledgeSearch{db: db, embeddingProvider: nil}
+}
+
 type KnowledgeSearch struct {
 	db                *sql.DB
 	embeddingProvider EmbeddingProvider
@@ -36,10 +47,12 @@ func CreateKnowledgeTables(db *sql.DB) error {
 		);`,
 		`CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(id,title,content,dimension,question);`,
 		`CREATE TABLE IF NOT EXISTS embedding(
-		    knowledge_id TEXT NOT NULL PRIMARY KEY,
+		    knowledge_id TEXT NOT NULL,
+			chunk_index INTEGER NOT NULL,
 			vector BLOB NOT NULL,
 			model TEXT NOT NULL,
-			create_at INTEGER NOT NULL
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY (knowledge_id, chunk_index)
 		);`,
 		`CREATE TRIGGER IF NOT EXISTS knowledge_fts_sync AFTER INSERT ON knowledge BEGIN
 		    INSERT INTO knowledge_fts(rowid,id,title,content,dimension,question)
@@ -47,7 +60,7 @@ func CreateKnowledgeTables(db *sql.DB) error {
 		END;`,
 		`CREATE TRIGGER IF NOT EXISTS knowledge_fts_update AFTER UPDATE ON knowledge BEGIN
 		    UPDATE knowledge_fts SET id=new.id,title=new.title,content=new.content,
-			                         dimension=new.dimension,question=new.question WHERE rowid=old.rowid
+			                         dimension=new.dimension,question=new.question WHERE rowid=old.rowid;
 		END;`,
 		`CREATE TRIGGER IF NOT EXISTS knowledge_fts_delete AFTER DELETE ON knowledge BEGIN
 			DELETE FROM knowledge_fts WHERE rowid = old.rowid;
@@ -137,12 +150,18 @@ func (ks *KnowledgeSearch) ftsSearch(query, dimension string, limit int) ([]*Sea
 	var results []*SearchResult
 	for rows.Next() {
 		var entry KnowledgeEntry
+		var tags string
 		var rank float64
-		if err := ks.scanKnowledgeRow(rows, &entry); err != nil {
+		if err := rows.Scan(&entry.ID, &entry.Title, &entry.Dimension, &entry.Content,
+			&entry.SourceFile, &entry.Question, &entry.ExpertAnswer, &entry.NoviceAnswer,
+			&tags, &rank); err != nil {
 			return nil, fmt.Errorf("scan row failed:%w", err)
 		}
-		if err := rows.Scan(&rank); err != nil {
-			return nil, fmt.Errorf("scan rank failed:%w", err)
+		if tags != "" {
+			entry.Tags = strings.Split(tags, ",")
+		}
+		if len(entry.Content) > 8000 {
+			entry.Content = entry.Content[:8000]
 		}
 		results = append(results, &SearchResult{
 			Entry:     &entry,
@@ -169,7 +188,7 @@ func (ks *KnowledgeSearch) embeddingSearch(query, dimension string, limit int) (
 
 	sql := `
 	    SELECT e.vector,k.*
-		FROM embeddings e
+		FROM embedding e
 		JOIN knowledge k ON k.id=e.knowledge_id
 	`
 
@@ -195,9 +214,13 @@ func (ks *KnowledgeSearch) embeddingSearch(query, dimension string, limit int) (
 	for rows.Next() {
 		var vector []byte
 		var entry KnowledgeEntry
+		var tags string
 		if err := rows.Scan(&vector, &entry.ID, &entry.Title, &entry.Dimension, &entry.Content,
-			&entry.SourceFile, &entry.Question, &entry.ExpertAnswer, &entry.NoviceAnswer, &entry.Tags); err != nil {
+			&entry.SourceFile, &entry.Question, &entry.ExpertAnswer, &entry.NoviceAnswer, &tags); err != nil {
 			continue
+		}
+		if tags != "" {
+			entry.Tags = strings.Split(tags, ",")
 		}
 		storedVector := ks.deserializeVector(vector)
 		similarity := ks.cosineSimilarity(queryVector, storedVector)
@@ -212,18 +235,43 @@ func (ks *KnowledgeSearch) embeddingSearch(query, dimension string, limit int) (
 		return ks.likeFallback(query, dimension, limit)
 	}
 
-	for i := 0; i < len(scored)-1; i++ {
-		for j := i + 1; j < len(scored); j++ {
-			if scored[j].similarity > scored[i].similarity {
-				scored[i], scored[j] = scored[j], scored[i]
+	// deduplicate: keep highest similarity per entry
+	best := make(map[string]struct {
+		entry      KnowledgeEntry
+		similarity float64
+	})
+	for _, item := range scored {
+		id := item.entry.ID
+		if prev, ok := best[id]; !ok || item.similarity > prev.similarity {
+			best[id] = item
+		}
+	}
+
+	var sorted []struct {
+		entry      KnowledgeEntry
+		similarity float64
+	}
+	for _, v := range best {
+		sorted = append(sorted, v)
+	}
+
+	for i := 0; i < len(sorted)-1; i++ {
+		for j := i + 1; j < len(sorted); j++ {
+			if sorted[j].similarity > sorted[i].similarity {
+				sorted[i], sorted[j] = sorted[j], sorted[i]
 			}
 		}
 	}
 
 	var results []*SearchResult
-	for _, item := range scored[:min(len(scored), limit)] {
+	for _, item := range sorted[:min(len(sorted), limit)] {
+		entry := item.entry
+		// truncate content to avoid token overflow (~8000 chars ≈ 2000 tokens)
+		if len(entry.Content) > 8000 {
+			entry.Content = entry.Content[:8000]
+		}
 		results = append(results, &SearchResult{
-			Entry:     &item.entry,
+			Entry:     &entry,
 			Score:     item.similarity,
 			MatchType: MatchTypeEmbedding,
 		})
@@ -279,12 +327,65 @@ func (ks *KnowledgeSearch) likeFallback(query, dimension string, limit int) ([]*
 }
 
 //知识条目生成向量嵌入并存储到数据库
+// chunkText splits text into chunks of approximately maxChars each.
+// It tries to split on paragraph and line boundaries first, then falls back to
+// hard-splitting by character count to ensure no chunk ever exceeds maxChars.
+func chunkText(text string, maxChars int) []string {
+	if len(text) <= maxChars {
+		return []string{text}
+	}
+	var chunks []string
+	var current strings.Builder
+
+	flush := func() {
+		if current.Len() > 0 {
+			chunks = append(chunks, strings.TrimSpace(current.String()))
+			current.Reset()
+		}
+	}
+
+	// Split by paragraphs first, then by lines
+	sections := strings.Split(text, "\n\n")
+	for _, section := range sections {
+		lines := strings.Split(section, "\n")
+		for _, line := range lines {
+			if current.Len()+len(line)+1 > maxChars {
+				flush()
+				if len(line) >= maxChars {
+					// hard split: copy chars until under limit
+					for len(line) > 0 {
+						if len(line) <= maxChars {
+							current.WriteString(line)
+							break
+						}
+						chunks = append(chunks, line[:maxChars])
+						line = line[maxChars:]
+					}
+					continue
+				}
+			}
+			if current.Len() > 0 {
+				current.WriteString("\n")
+			}
+			current.WriteString(line)
+		}
+		if current.Len() > 0 {
+			current.WriteString("\n\n")
+		}
+	}
+
+	flush()
+	if len(chunks) == 0 {
+		return []string{text}
+	}
+	return chunks
+}
+
 func (ks *KnowledgeSearch)IndexEmbeddings(ids []string)(int,error){
 	if ks.embeddingProvider==nil{
 		return 0,fmt.Errorf("no embedding provider configured")
 
 	}
-
 
 	//查询待索引的知识
 	var sql string
@@ -302,7 +403,7 @@ func (ks *KnowledgeSearch)IndexEmbeddings(ids []string)(int,error){
 		}
 
 	}else{
-		sql=`SELECT * FROM knowledge WHERE id NOT IN (SELECT knowledge_id FROM embeddings)`
+		sql=`SELECT * FROM knowledge WHERE id NOT IN (SELECT knowledge_id FROM embedding)`
 	}
 
 	rows,err:=ks.db.Query(sql,params...)
@@ -324,25 +425,37 @@ func (ks *KnowledgeSearch)IndexEmbeddings(ids []string)(int,error){
 		return 0,nil
 	}
 
-	texts:=make([]string,len(entries))
-	for i,entry:=range entries{
-		texts[i]=entry.Title+"\n"+entry.Content+"\n"+entry.Question
+	//构建 (entry, chunkText) pairs，chunks 超长会被拆分
+	type entryChunk struct {
+		entry KnowledgeEntry
+		chunk string
+	}
+	var pairs []entryChunk
+	for _, entry := range entries {
+		fullText := entry.Title + "\n" + entry.Content + "\n" + entry.Question
+		chunks := chunkText(fullText, 18000)
+		for ci := range chunks {
+			pairs = append(pairs, entryChunk{entry: entry, chunk: chunks[ci]})
+		}
 	}
 
-
-	//向量化并存入embedding表
+	// 按 batchSize 分批 embed
 	batchSize:=100
 	var indexed int
 
-	for i:=0;i<len(texts);i+=batchSize{
+	for i:=0;i<len(pairs);i+=batchSize{
 		end:=i+batchSize
-
-		if end>len(texts){
-			end=len(texts)
+		if end>len(pairs){
+			end=len(pairs)
 		}
 
-		batch:=texts[i:end]
-		vectors,err:=ks.embeddingProvider.EmbedBatch(batch)
+		batch:=pairs[i:end]
+		texts:=make([]string,len(batch))
+		for j,p:=range batch{
+			texts[j]=p.chunk
+		}
+
+		vectors,err:=ks.embeddingProvider.EmbedBatch(texts)
 		if err!=nil{
 			return indexed,fmt.Errorf("embed batch failed:%w",err)
 		}
@@ -353,18 +466,22 @@ func (ks *KnowledgeSearch)IndexEmbeddings(ids []string)(int,error){
 		}
 
 		stmt,err:=tx.Prepare(`
-			INSERT OR REPLACE INTO embeddings (knowledge_id,vector,model,created_at)
-			VALUES(?,?,?,strftime('%s','now'),)
+			INSERT OR REPLACE INTO embedding (knowledge_id,chunk_index,vector,model,created_at)
+			VALUES(?,?,?,?,strftime('%s','now'))
 		`)
 		if err!=nil{
 			tx.Rollback()
 			return indexed,fmt.Errorf("prepare statement failed:%w",err)
 		}
 
-		for j,vector:=range vectors{
-			if _,err:=stmt.Exec(entries[i+j].ID,ks.serializeVector(vector),ks.embeddingProvider.Model());err!=nil{
+		// assign sequential indices within the batch
+		prevCount := make(map[string]int)
+		for j, pair := range batch {
+			idx := prevCount[pair.entry.ID]
+			prevCount[pair.entry.ID] = idx + 1
+			if _, err := stmt.Exec(pair.entry.ID, idx, ks.serializeVector(vectors[j]), ks.embeddingProvider.Model()); err != nil {
 				tx.Rollback()
-				return indexed,fmt.Errorf("exec statement failed:%w",err)
+				return indexed, fmt.Errorf("exec statement failed:%w", err)
 			}
 		}
 		if err:=tx.Commit();err!=nil{
@@ -488,10 +605,10 @@ func (ks *KnowledgeSearch) mergeResults(fts, emb []*SearchResult, limit int) []*
 	}
 
 	for _, result := range all {
-		if seen[result.Entry.ID] {
+		if seen[result.Entry.SourceFile] {
 			continue
 		}
-		seen[result.Entry.ID] = true
+		seen[result.Entry.SourceFile] = true
 		merged = append(merged, &SearchResult{
 			Entry:     result.Entry,
 			Score:     result.Score,

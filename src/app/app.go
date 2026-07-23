@@ -5,6 +5,7 @@ import (
 	"MyOfferPilot/src/command"
 	appcontext "MyOfferPilot/src/context"
 	hooks "MyOfferPilot/src/hook"
+	"MyOfferPilot/src/knowledge"
 	"MyOfferPilot/src/logger"
 	"MyOfferPilot/src/memory"
 	"MyOfferPilot/src/permission"
@@ -15,6 +16,7 @@ import (
 	tool "MyOfferPilot/src/tools"
 	"context"
 	"os"
+	"path/filepath"
 )
 
 const SystemPrompt = `你是 OfferPilot，一个全链路求职辅导 Agent，专注于 AI Agent / LLM 工程方向。
@@ -52,11 +54,17 @@ const SystemPrompt = `你是 OfferPilot，一个全链路求职辅导 Agent，�
 - 如果问题和回答边界不清，先说明不确定性，再基于可见内容谨慎诊断
 
 工作方式：
-- 用户贴入 JD → 自动解析并给出面试准备方向
-- 用户贴入简历 + JD → 匹配度分析 + 简历优化建议
-- 用户输入面试题 + 回答 → 诊断评分 + 对比 + 追问
-- 用户说"模拟面试" → 生成题目序列并逐题诊断
-- 用户说"面试模拟"/"实时面试" → 启动实时面试模拟，逐题 TTS 提问 + 实时缺陷分析`
+- 用户贴入 JD → **必须调用 analyze_jd 工具**，不要自己分析
+- 用户说"模拟面试"/"生成面试题" → **必须调用 mock_interview 工具**
+- 用户说"搜索"/"查找"面试题 → **必须调用 search_knowledge 工具**
+- 用户输入面试回答 → 诊断评分 + 追问
+
+**强制规则：**
+1. 你没有实时更新的知识，必须调用工具来获取信息
+2. 分析 JD 必须用 analyze_jd 工具，工具会返回结构化数据
+3. 搜索面试题必须用 search_knowledge 工具
+4. 生成模拟面试题必须用 mock_interview 工具
+5. 禁止直接凭记忆回答，应该先调用工具`
 
 type AppOptions struct {
 	Model           string
@@ -86,6 +94,24 @@ func CreateApp(opts *AppOptions) *App {
 	queryEngine := queryengine.NewQueryEngine(queryengine.QueryEngineOptions{Providers: providers})
 
 	toolRegistry := tool.NewToolRegistry()
+
+	if kbPath := os.Getenv("KNOWLEDGE_DB_PATH"); kbPath != "" {
+		ks := initKnowledgeSearch(kbPath)
+		if ks != nil {
+			tool.SetKnowledgeSearch(ks)
+			logger.DefaultLogger.Info("Knowledge search initialized", map[string]interface{}{"path": kbPath})
+		}
+	}
+
+	toolRegistry.Registry(tool.SearchKnowledge())
+	toolRegistry.Registry(tool.AnalyzeJD())
+	toolRegistry.Registry(tool.MockInterview())
+
+	logger.DefaultLogger.Info("Tools registered", map[string]interface{}{
+		"toolCount": len(toolRegistry.ListSchemas()),
+		"tools":     getRegisteredToolNames(toolRegistry),
+	})
+
 	permissionGate := permission.NewPermissionGate()
 	contextManager := appcontext.NewContextManager(nil)
 
@@ -125,7 +151,7 @@ func CreateApp(opts *AppOptions) *App {
 	subAgentRuntime.Register(subagent.SubAgentConfig{ID: "reporter", Role: subagent.SubAgentRoleReporter})
 	subAgentRuntime.Register(subagent.SubAgentConfig{ID: "jd-analyst", Role: subagent.SubAgentRoleJDAnalyst})
 	subAgentRuntime.Register(subagent.SubAgentConfig{ID: "resume-optimizer", Role: subagent.SubAgentRoleResumeOptimizer})
-	subAgentRuntime.Register(subagent.SubAgentConfig{ID: "gap-anlyzer", Role: subagent.SubAgentRoleGapAanlyzer})
+	subAgentRuntime.Register(subagent.SubAgentConfig{ID: "gap-analyzer", Role: subagent.SubAgentRoleGapAnalyzer})
 
 	hookPipeline := hooks.NewHookPipeline()
 	hookPipeline.Register(&hooks.InputSanitizerHook{})
@@ -252,7 +278,7 @@ func buildProviders() []queryengine.ProviderConfig {
 			defaultModel = "deepseek-chat"
 		}
 
-		providerInst, err := provider.NewDeepSeekProvider(ctx, apiKey, os.Getenv("DEEPSEEK_BASE_URL"))
+		providerInst, err := provider.NewDeepSeekProvider(ctx, apiKey, os.Getenv("DEEPSEEK_BASE_URL"), defaultModel)
 		if err != nil {
 			logger.DefaultLogger.Warn("Failed to create DeepSeek provider", map[string]interface{}{"error": err.Error()})
 		} else if err := providerInst.Validate(ctx); err != nil {
@@ -260,7 +286,7 @@ func buildProviders() []queryengine.ProviderConfig {
 		} else {
 			providers = append(providers, queryengine.ProviderConfig{
 				Provider:     providerInst,
-				Models:       []string{defaultModel, "deepseek-chat", "deepseek-coder"},
+				Models:       []string{defaultModel, "deepseek-v4-pro-cc", "deepseek-coder"},
 				DefaultModel: defaultModel,
 			})
 			logger.DefaultLogger.Info("DeepSeek provider registered")
@@ -280,4 +306,31 @@ func buildProviders() []queryengine.ProviderConfig {
 
 	return providers
 
+}
+
+func getRegisteredToolNames(r *tool.ToolRegistry) []string {
+	schemas := r.ListSchemas()
+	names := make([]string, len(schemas))
+	for i, s := range schemas {
+		names[i] = s.Name
+	}
+	return names
+}
+
+func initKnowledgeSearch(dbPath string) *knowledge.KnowledgeSearch {
+	logger.DefaultLogger.Info("initKnowledgeSearch called", map[string]interface{}{"dbPath": dbPath})
+	absPath, err := filepath.Abs(dbPath)
+	if err != nil {
+		logger.DefaultLogger.Warn("knowledge db path invalid", map[string]interface{}{"dbPath": dbPath, "error": err.Error()})
+		return nil
+	}
+	logger.DefaultLogger.Info("knowledge db resolved to", map[string]interface{}{"absPath": absPath})
+	ks := knowledge.NewKnowledgeSearchFromFile(absPath)
+	if ks == nil {
+		logger.DefaultLogger.Warn("knowledge db failed to open", map[string]interface{}{"absPath": absPath})
+		return nil
+	}
+	cnt, _ := ks.Count()
+	logger.DefaultLogger.Info("knowledge db loaded", map[string]interface{}{"absPath": absPath, "entries": cnt})
+	return ks
 }

@@ -60,8 +60,9 @@ func SearchKnowledge() *ToolDefinition {
 			type result struct {
 				Title        string  `json:"title"`
 				Dimension    string  `json:"dimension"`
+				Content      string  `json:"content"`
 				Questions    string  `json:"question"`
-				ExpertAnswer string  `json:"expertAnser"`
+				ExpertAnswer string  `json:"expertAnswer"`
 				Score        float64 `json:"score"`
 			}
 
@@ -100,12 +101,12 @@ func SearchKnowledge() *ToolDefinition {
 
 				results = make([]result, len(filtered))
 				for i, r := range filtered {
-					results[i] = result{r.Title, r.Dimension, r.Question, r.ExpertAnswer, 1 - float64(i)*0.1}
+					results[i] = result{r.Title, r.Dimension, "", r.Question, r.ExpertAnswer, 1 - float64(i)*0.1}
 				}
 			} else {
 				results = make([]result, len(dbResults))
 				for i, r := range dbResults {
-					results[i] = result{r.Title, r.Dimension, r.Question, r.ExpertAnswer, 1 - float64(i)*0.1}
+					results[i] = result{r.Title, r.Dimension, r.Content, r.Question, r.ExpertAnswer, 1 - float64(i)*0.1}
 				}
 			}
 

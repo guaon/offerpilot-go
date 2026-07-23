@@ -80,6 +80,7 @@ func (p *OpenAIProvider) Stream(params queryengine.StreamParams) <-chan queryeng
 		}
 		if len(params.Tools) > 0 {
 			request.Tools = p.toOpenAITools(params.Tools)
+			request.ToolChoice = "auto"
 		}
 
 		stream, err := p.client.CreateChatCompletionStream(ctx, request)
@@ -204,12 +205,15 @@ func (p *OpenAIProvider) buildMessages(messages []queryengine.Message) []openai.
 			toolCalls := make([]openai.ToolCall, 0, len(*msg.ToolCalls))
 			for _, tc := range *msg.ToolCalls {
 				var argsJSON string
-				if tc.Input != nil {
+				if tc.Input != nil && len(tc.Input) > 0 {
 					argsBytes, _ := json.Marshal(tc.Input)
 					argsJSON = string(argsBytes)
+				} else {
+					argsJSON = "{}"
 				}
 				toolCalls = append(toolCalls, openai.ToolCall{
-					ID: tc.ID,
+					ID:   tc.ID,
+					Type: openai.ToolTypeFunction,
 					Function: openai.FunctionCall{
 						Name:      tc.Name,
 						Arguments: argsJSON,

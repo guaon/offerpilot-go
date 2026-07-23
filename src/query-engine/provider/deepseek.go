@@ -9,14 +9,14 @@ type DeepSeekProvider struct {
 	*OpenAIProvider
 }
 
-func NewDeepSeekProvider(ctx context.Context, apiKey, baseURL string) (*DeepSeekProvider, error) {
+func NewDeepSeekProvider(ctx context.Context, apiKey, baseURL, model string) (*DeepSeekProvider, error) {
 	if baseURL == "" {
 		baseURL = "https://api.deepseek.com"
 	}
 
 	config := &OpenAIConfig{
 		APIKey:  apiKey,
-		Model:   "deepseek-chat",
+		Model:   model,
 		BaseURL: baseURL,
 		Name:    "deepseek",
 	}
