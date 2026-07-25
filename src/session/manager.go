@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/cloudwego/eino/schema"
@@ -11,6 +12,7 @@ import (
 )
 
 type SessionManager struct {
+	mu          sync.Mutex
 	sessions    map[string]*Session
 	checkpoints map[string][]*CheckPoints
 	db          *sql.DB
@@ -50,6 +52,17 @@ func NewSessionManager(dbPath string) (*SessionManager, error) {
 	return sm, nil
 }
 
+func (sm *SessionManager) EnsureLoaded() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if sm.sessions == nil {
+		sm.sessions = make(map[string]*Session)
+	}
+	if sm.checkpoints == nil {
+		sm.checkpoints = make(map[string][]*CheckPoints)
+	}
+}
+
 func createSessionTables(db *sql.DB) error {
 	queries := []string{
 		`CREATE TABLE IF NOT EXISTS sessions(
@@ -57,7 +70,7 @@ func createSessionTables(db *sql.DB) error {
 			state TEXT NOT NULL,
 			user_id TEXT,
 			metadata TEXT NOT NULL,
-			create_at INTEGER NOT NULL,
+			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL
 		);`,
 		`CREATE TABLE IF NOT EXISTS messages(
@@ -103,11 +116,11 @@ func (sm *SessionManager) Create(userID string) *Session {
 	sm.sessions[s.ID] = s
 
 	if sm.db != nil {
-		metadataJSON, _ := json.Marshal(s.Messages)
+		metadataJSON, _ := json.Marshal(s.Metadata)
 		sm.db.Exec(`
 		    INSERT INTO sessions(id,state,user_id,metadata,created_at,updated_at)
-			VALUES(?,?,?,?,?,?)
-		`, s.ID, s.State, userID, string(metadataJSON), now/1000, now/1000)
+			VALUES(?,?,?,?,?,?)`,
+			s.ID, s.State, userID, string(metadataJSON), now/1000, now/1000)
 	}
 
 	return s
@@ -147,15 +160,20 @@ func (sm *SessionManager) Transition(id string, newState SessionState) error {
 func (sm *SessionManager) Get(id string) (*Session, error) {
 	s := sm.sessions[id]
 	if s == nil {
+		if sm.db != nil {
+			if err := sm.loadSessionFromDB(id); err == nil && sm.sessions[id] != nil {
+				return sm.sessions[id], nil
+			}
+		}
 		return nil, fmt.Errorf("session %s not found", id)
 	}
 	return s, nil
 }
 
 func (sm *SessionManager) GetMessages(id string) ([]*schema.Message, error) {
-	s := sm.sessions[id]
-	if s == nil {
-		return nil, fmt.Errorf("session %s not found", id)
+	s, err := sm.Get(id)
+	if err != nil {
+		return nil, err
 	}
 	return s.Messages, nil
 }
@@ -332,7 +350,7 @@ func (sm *SessionManager) loadFromDB() error {
 		return nil
 	}
 
-	rows, err := sm.db.Query("SELECT id,state,user_id,metadata,created_at,updated_at FROM sessions")
+	rows, err := sm.db.Query("SELECT id,state,user_id,metadata,created_at,updated_at FROM sessions ORDER BY created_at DESC")
 	if err != nil {
 		return fmt.Errorf("query sessions failed:%w", err)
 	}
@@ -397,4 +415,74 @@ func (sm *SessionManager) loadFromDB() error {
 
 	}
 	return rows.Err()
+}
+
+func (sm *SessionManager) loadSessionFromDB(id string) error {
+	if sm.db == nil {
+		return fmt.Errorf("no database")
+	}
+
+	row := sm.db.QueryRow(
+		"SELECT id,state,user_id,metadata,created_at,updated_at FROM sessions WHERE id=?",
+		id,
+	)
+
+	var sid, state, userID, metadataJSON string
+	var createdAt, updatedAt int64
+	if err := row.Scan(&sid, &state, &userID, &metadataJSON, &createdAt, &updatedAt); err != nil {
+		return fmt.Errorf("session not found in db: %w", err)
+	}
+
+	var metadata SessionMetadata
+	if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
+		return fmt.Errorf("failed to unmarshal metadata: %w", err)
+	}
+
+	s := &Session{
+		ID:        sid,
+		State:     SessionState(state),
+		CreatedAt: createdAt * 1000,
+		UpdatedAt: updatedAt * 1000,
+		Messages:  make([]*schema.Message, 0),
+		Metadata:  metadata,
+	}
+
+	if userID != "" {
+		s.Metadata.UserID = userID
+	}
+
+	msgRows, err := sm.db.Query(
+		"SELECT role,content,tool_call_id,tool_calls FROM messages WHERE session_id=? ORDER BY id",
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("query messages failed: %w", err)
+	}
+	defer msgRows.Close()
+
+	for msgRows.Next() {
+		var role, content, toolCallID, toolCallsJSON string
+		if err := msgRows.Scan(&role, &content, &toolCallID, &toolCallsJSON); err != nil {
+			return fmt.Errorf("scan message failed: %w", err)
+		}
+
+		msg := &schema.Message{
+			Role:       schema.RoleType(role),
+			Content:    content,
+			ToolCallID: toolCallID,
+		}
+
+		if toolCallsJSON != "" {
+			var toolCalls []schema.ToolCall
+			if err := json.Unmarshal([]byte(toolCallsJSON), &toolCalls); err == nil {
+				msg.ToolCalls = toolCalls
+			}
+		}
+
+		s.Messages = append(s.Messages, msg)
+	}
+	msgRows.Close()
+
+	sm.sessions[id] = s
+	return nil
 }

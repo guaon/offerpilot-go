@@ -2,7 +2,6 @@ package app
 
 import (
 	"MyOfferPilot/src/agent"
-	"MyOfferPilot/src/command"
 	appcontext "MyOfferPilot/src/context"
 	hooks "MyOfferPilot/src/hook"
 	"MyOfferPilot/src/knowledge"
@@ -82,7 +81,6 @@ type App struct {
 	QueryEngine     *queryengine.QueryEngine
 	ToolRegistry    *tool.ToolRegistry
 	MemoryStore     *memory.MemoryStore
-	CommandParser   *command.CommandParser
 	HookPipeline    *hooks.HookPipeline
 	SubAgentRuntime *subagent.SubAgentRuntime
 }
@@ -116,17 +114,20 @@ func CreateApp(opts *AppOptions) *App {
 	contextManager := appcontext.NewContextManager(nil)
 
 	var sessionManager *session.SessionManager
+	var err error
 	if opts != nil && opts.SessionManager != nil {
 		sessionManager = opts.SessionManager
 	} else {
-		var err error
-		sessionManager, err = session.NewSessionManager("")
+		dbPath := os.Getenv("SESSION_DB_PATH")
+		sessionManager, err = session.NewSessionManager(dbPath)
 		if err != nil {
 			logger.DefaultLogger.Warn("Failed to create session manager", map[string]interface{}{"error": err.Error()})
 			sessionManager = &session.SessionManager{}
+		} else if dbPath != "" {
+			logger.DefaultLogger.Info("Session manager loaded", map[string]interface{}{"dbPath": dbPath})
 		}
-
 	}
+	sessionManager.EnsureLoaded()
 
 	var memStore *memory.MemoryStore
 	if opts != nil && opts.MemoryStore != nil {
@@ -156,13 +157,6 @@ func CreateApp(opts *AppOptions) *App {
 	hookPipeline := hooks.NewHookPipeline()
 	hookPipeline.Register(&hooks.InputSanitizerHook{})
 	hookPipeline.Register(&hooks.TokenCounterHook{})
-
-	commandParser := command.NewCommandParser()
-	commandParser.Register(&command.HelpCommand{})
-	commandParser.Register(&command.StatusCommand{})
-	commandParser.Register(&command.DimensionsCommand{})
-	commandParser.Register(&command.QuitCommand{})
-	commandParser.Register(&command.ResetCommand{})
 
 	contextManager.SetLayer(appcontext.ContextWindowKeySystem, SystemPrompt, -1)
 
@@ -206,7 +200,6 @@ func CreateApp(opts *AppOptions) *App {
 		QueryEngine:     queryEngine,
 		ToolRegistry:    toolRegistry,
 		MemoryStore:     memStore,
-		CommandParser:   commandParser,
 		HookPipeline:    hookPipeline,
 		SubAgentRuntime: subAgentRuntime,
 	}

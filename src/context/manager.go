@@ -58,13 +58,6 @@ func NewContextManager(opts *ContextManagerOptions) *ContextManager {
 	return m
 }
 
-func NewContextManagerWithMaxTokens(maxTokens int) *ContextManager {
-	return &ContextManager{
-		maxTokens: maxTokens,
-		layers:    make(map[ContextWindowKey]*ContextLayer),
-	}
-}
-
 func (cm *ContextManager) SetLayer(name ContextWindowKey, content string, priority int) {
 	if priority < 0 {
 		priority = cm.defaultPriority(name)

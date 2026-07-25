@@ -258,15 +258,16 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID string, userMessage stri
 	}
 
 	if finalText == "" {
-		finalText = "抱歉，我在处理您的请求时达到了最大迭代次数，未能生成完整回复，请尝试简化问题或重新提问"
+		finalText = "抱歉，我在处理您的请求时未能生成完整回复，请尝试简化问题或重新提问"
 		assistantMsg := schema.AssistantMessage(finalText, nil)
 		if err := config.SessionManager.AddMessage(sessionID, assistantMsg); err != nil {
 			return "", err
 		}
 
-		log.Warn("max iterations reached", map[string]interface{}{
-			"sessionID":  sessionID,
-			"iterations": al.usage.Iterations,
+		log.Warn("empty response", map[string]interface{}{
+			"sessionID":     sessionID,
+			"iterations":    al.usage.Iterations,
+			"maxIterations": al.maxIterations,
 		})
 	}
 

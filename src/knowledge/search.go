@@ -377,6 +377,8 @@ func chunkText(text string, maxChars int) []string {
 	return chunks
 }
 
+
+//用于为知识条目生成向量嵌入并索引到数据库
 func (ks *KnowledgeSearch) IndexEmbeddings(ids []string) (int, error) {
 	if ks.embeddingProvider == nil {
 		return 0, fmt.Errorf("no embedding provider configured")
@@ -421,7 +423,7 @@ func (ks *KnowledgeSearch) IndexEmbeddings(ids []string) (int, error) {
 		return 0, nil
 	}
 
-	//构建 (entry, chunkText) pairs，chunks 超长会被拆分
+	//文本分块
 	type entryChunk struct {
 		entry KnowledgeEntry
 		chunk string
@@ -435,7 +437,7 @@ func (ks *KnowledgeSearch) IndexEmbeddings(ids []string) (int, error) {
 		}
 	}
 
-	// 按 batchSize 分批 embed
+	// 按 batchSize 分批 嵌入
 	batchSize := 100
 	var indexed int
 

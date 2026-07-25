@@ -4,6 +4,7 @@ import "encoding/json"
 
 type StreamCollector struct {
 	Text             string
+	Thinking         string
 	ToolCalls        []ToolCall
 	CurrentToolInput string
 	CurrentToolId    string
@@ -32,7 +33,7 @@ func (sc *StreamCollector) Feed(event StreamEvent) {
 		}
 	case "thinking_delta":
 		if thinkingDelta, ok := event.(*ThinkingDeltaEvent); ok {
-			_ = thinkingDelta
+			sc.Thinking += thinkingDelta.Content
 		}
 	case "tool_use_start":
 		if toolStart, ok := event.(*ToolUseStartEvent); ok {
@@ -76,6 +77,8 @@ func (sc *StreamCollector) Result() ParsedResponse {
 		response.Type = TextResponse
 		if sc.Text != "" {
 			response.Content = &sc.Text
+		} else if sc.Thinking != "" {
+			response.Content = &sc.Thinking
 		}
 	}
 

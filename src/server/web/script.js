@@ -222,7 +222,6 @@ async function streamChat(text,onEvent,onDone){
       try{
         var evt=JSON.parse(payload);
         onEvent(evt);
-        if(evt.sessionId){state.currentSid=evt.sessionId;localStorage.setItem(STORAGE.current,state.currentSid);}
       }catch(e){console.warn('parse fail:',payload,e);}
     }
   }
@@ -235,6 +234,20 @@ function handleEvent(evt,accum,session){
     case 'tool_call':appendToolEvent(evt.name,evt.input);break;
     case 'tool_result':appendToolResult(evt.name,evt.result);break;
     case 'error':appendSystemMessage('错误: '+(evt.error||'未知错误'));break;
+    case 'session':
+      var serverSid=evt.sessionId;
+      if(serverSid&&serverSid!==state.currentSid){
+        var oldSid=state.currentSid;
+        if(oldSid&&state.sessions[oldSid]){
+          state.sessions[serverSid]=state.sessions[oldSid];
+          state.sessions[serverSid].id=serverSid;
+          delete state.sessions[oldSid];
+        }
+        state.currentSid=serverSid;
+        localStorage.setItem(STORAGE.current,serverSid);
+        saveSessions();
+      }
+      break;
   }
   scrollToBottom();
 }

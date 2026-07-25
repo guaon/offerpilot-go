@@ -22,6 +22,7 @@ import (
 	"MyOfferPilot/src/logger"
 	"MyOfferPilot/src/realtime"
 
+	"github.com/cloudwego/eino/schema"
 	pdfreader "github.com/ledongthuc/pdf"
 )
 
@@ -153,7 +154,7 @@ func (s *Server) handleChat(w http.ResponseWriter, req *http.Request) {
 	if err := json.NewDecoder(req.Body).Decode(&chatReq); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
-		return
+		return 
 	}
 
 	if chatReq.Message == "" {
@@ -215,11 +216,20 @@ func (s *Server) handleChat(w http.ResponseWriter, req *http.Request) {
 			sessionID = chatReq.SessionID
 		}
 	}
-
+	if sessionID == "" {
+		if c, err := req.Cookie("offerpilot_sid"); err == nil && c.Value != "" {
+			_, err := appInst.SessionManager.Get(c.Value)
+			if err == nil {
+				sessionID = c.Value
+			}
+		}
+	}
 	if sessionID == "" {
 		newSession := appInst.SessionManager.Create("")
 		sessionID = newSession.ID
 	}
+
+	http.SetCookie(w, &http.Cookie{Name: "offerpilot_sid", Value: sessionID, Path: "/", HttpOnly: false, SameSite: http.SameSiteLaxMode, MaxAge: 86400 * 30})
 
 	send(ChatEvent{Type: "session", SessionID: sessionID})
 
@@ -252,11 +262,6 @@ func (s *Server) handleSession(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if req.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	if !s.validateAuth(req) {
 		w.WriteHeader(http.StatusUnauthorized)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
@@ -266,11 +271,79 @@ func (s *Server) handleSession(w http.ResponseWriter, req *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	session := s.app.SessionManager.Create("")
-
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"sessionId": session.ID})
+
+	switch req.Method {
+	case http.MethodPost:
+		// Try to reuse existing session from cookie first
+		var sessionID string
+		var existingMsgs []*schema.Message
+		if c, err := req.Cookie("offerpilot_sid"); err == nil && c.Value != "" {
+			if sess, err := s.app.SessionManager.Get(c.Value); err == nil {
+				sessionID = c.Value
+				existingMsgs, _ = s.app.SessionManager.GetMessages(c.Value)
+				_ = sess
+			}
+		}
+		if sessionID == "" {
+			session := s.app.SessionManager.Create("")
+			sessionID = session.ID
+		}
+		fmt.Printf("[DEBUG] handleSession POST sid=%s\n", sessionID)
+		http.SetCookie(w, &http.Cookie{Name: "offerpilot_sid", Value: sessionID, Path: "/", HttpOnly: false, SameSite: http.SameSiteLaxMode, MaxAge: 86400 * 30})
+		w.WriteHeader(http.StatusOK)
+		resp := map[string]interface{}{"sessionId": sessionID}
+		if len(existingMsgs) > 0 {
+			type mj struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			}
+			list := make([]mj, 0, len(existingMsgs))
+			for _, m := range existingMsgs {
+				if m.Content != "" && (m.Role == "user" || m.Role == "assistant") {
+					list = append(list, mj{Role: string(m.Role), Content: m.Content})
+				}
+			}
+			if len(list) > 0 {
+				resp["messages"] = list
+			}
+		}
+		json.NewEncoder(w).Encode(resp)
+	case http.MethodGet:
+		sid := req.URL.Query().Get("id")
+		if sid == "" {
+			// Fallback: try cookie
+			if c, err := req.Cookie("offerpilot_sid"); err == nil && c.Value != "" {
+				sid = c.Value
+			}
+		}
+		if sid == "" {
+			http.Error(w, "id required", http.StatusBadRequest)
+			return
+		}
+		sess, err := s.app.SessionManager.Get(sid)
+		if err != nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		msgs, _ := s.app.SessionManager.GetMessages(sid)
+		out := make([]map[string]interface{}, 0, len(msgs))
+		for _, m := range msgs {
+			out = append(out, map[string]interface{}{
+				"role":    string(m.Role),
+				"content": m.Content,
+			})
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"id":        sess.ID,
+			"messages":  out,
+			"createdAt": sess.CreatedAt,
+			"updatedAt": sess.UpdatedAt,
+		})
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, req *http.Request) {
@@ -1590,20 +1663,11 @@ func extractTextFromDocx(data []byte) (string, error) {
 	}
 	defer rc.Close()
 
-	type wT struct {
-		XMLName xml.Name `xml:"w:t"`
-		Space   string   `xml:"xml:space,attr"`
-		Text    string   `xml:",chardata"`
-	}
-	type wP struct {
-		XMLName xml.Name `xml:"w:p"`
-		Texts   []wT     `xml:"w:r>w:t"`
-	}
-
 	dec := xml.NewDecoder(rc)
 	var (
 		out       strings.Builder
-		inPara    bool
+		inP       bool
+		inT       bool
 		paraStart = false
 	)
 	for {
@@ -1618,24 +1682,27 @@ func extractTextFromDocx(data []byte) (string, error) {
 		case xml.StartElement:
 			switch t.Name.Local {
 			case "p":
-				inPara = true
+				inP = true
 				paraStart = true
 			case "t":
-				if inPara {
-					var wt wT
-					if err := dec.DecodeElement(&wt, &t); err != nil {
-						return "", fmt.Errorf("decode w:t: %w", err)
-					}
-					if paraStart && out.Len() > 0 {
-						out.WriteString("\n")
-					}
-					paraStart = false
-					out.WriteString(wt.Text)
+				if inP {
+					inT = true
 				}
 			}
+		case xml.CharData:
+			if inT {
+				if paraStart && out.Len() > 0 {
+					out.WriteString("\n")
+				}
+				paraStart = false
+				out.WriteString(string(t))
+			}
 		case xml.EndElement:
-			if t.Name.Local == "p" {
-				inPara = false
+			switch t.Name.Local {
+			case "t":
+				inT = false
+			case "p":
+				inP = false
 				out.WriteString("\n")
 			}
 		}
@@ -1780,6 +1847,14 @@ func (s *Server) handleStaticFile(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Patch the Next.js page chunk to restore messages on load.
+	// Two replacements:
+	// 1. Save setMessages to window.__OP_SET_MSGS__ so it survives minification.
+	// 2. After POST /api/session returns, check for embedded messages.
+	if strings.Contains(filePath, "page-") && strings.HasSuffix(filePath, ".js") {
+		data = patchPageChunk(data)
+	}
+
 	contentType := getContentType(filepath.Ext(filePath))
 	w.Header().Set("Content-Type", contentType)
 	w.WriteHeader(http.StatusOK)
@@ -1817,6 +1892,112 @@ func (s *Server) handleStaticOrSPA(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", contentType)
 	w.WriteHeader(http.StatusOK)
 	w.Write(data)
+}
+
+// buildMessageInjectionScript builds a <script> tag that restores previous
+// session messages after React finishes hydrating. Because React 18 strict
+// hydration wipes out DOM injected before it loads, we use a two-phase
+// approach: (1) embed the data as JSON, (2) wait for React to render via
+// requestAnimationFrame, then inject messages into the DOM.
+func buildMessageInjectionScript(sessionID string, msgs []*schema.Message) string {
+	type msgJSON struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	list := make([]msgJSON, 0, len(msgs))
+	for _, m := range msgs {
+		role := string(m.Role)
+		if role != "user" && role != "assistant" {
+			continue
+		}
+		if m.Content == "" {
+			continue
+		}
+		list = append(list, msgJSON{Role: role, Content: m.Content})
+	}
+	if len(list) == 0 {
+		return ""
+	}
+
+	data, _ := json.Marshal(list)
+	return `<script>` +
+		`window.__OP_MSGS__=` + string(data) + `;` +
+		`window.__OP_SID__="` + html.EscapeString(sessionID) + `";` +
+		`(function(){` +
+		`var msgs=window.__OP_MSGS__;if(!msgs||!msgs.length)return;` +
+		`function inject(){` +
+		`var container=document.querySelector('main .flex-1.overflow-y-auto .mx-auto');` +
+		`if(!container)return;` +
+		`var welcome=container.querySelector('.animate-fade-in');` +
+		`// Only inject if React has rendered (welcome is visible or messages area exists)` +
+		`if(!welcome||welcome.offsetParent===null){` +
+		`var existing=container.querySelector('[data-op-msg]');` +
+		`if(!existing)return;` +
+		`}` +
+		`if(welcome)welcome.style.display='none';` +
+		`var existing=container.querySelectorAll('[data-op-msg]');` +
+		`for(var i=0;i<existing.length;i++)existing[i].remove();` +
+		`var frag=document.createDocumentFragment();` +
+		`msgs.forEach(function(m){` +
+		`var div=document.createElement('div');` +
+		`div.className='flex '+(m.role==='user'?'justify-end':'');` +
+		`div.setAttribute('data-op-msg','1');` +
+		`if(m.role==='user'){` +
+		`div.innerHTML='<div class="flex items-start gap-3 max-w-[75%]"><div class="rounded-2xl rounded-tr-md bg-primary px-4 py-3 text-sm text-white shadow-card"><p class="whitespace-pre-wrap leading-relaxed">'+` +
+		`m.content.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</p></div></div>';` +
+		`}else{` +
+		`div.innerHTML='<div class="flex items-start gap-3 max-w-[85%]"><div class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-sky-500 to-cyan shadow-sm"><span style="color:white;font-size:12px">OP</span></div><div class="flex-1 min-w-0"><div class="rounded-2xl rounded-tl-md px-4 py-3 shadow-card border border-slate-100 bg-white"><div class="text-sm leading-relaxed text-slate-700 whitespace-pre-wrap">'+` +
+		`m.content.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</div></div></div></div>';` +
+		`}` +
+		`frag.appendChild(div);` +
+		`});` +
+		`container.appendChild(frag);` +
+		`var main=document.querySelector('main');` +
+		`if(main)main.scrollTop=main.scrollHeight;` +
+		`}` +
+		`// Wait for React hydration via double rAF, then inject.` +
+		`// Also retry on a short timer in case React is slower.` +
+		`var tries=0;` +
+		`function tryInject(){` +
+		`if(tries++>10)return;` +
+		`var ready=document.querySelector('main .flex-1.overflow-y-auto .mx-auto');` +
+		`if(!ready){setTimeout(tryInject,200);return;}` +
+		`requestAnimationFrame(function(){` +
+		`requestAnimationFrame(function(){` +
+		`inject();` +
+		`});` +
+		`});` +
+		`}` +
+		`tryInject();` +
+		`})();` +
+		`</script>`
+}
+
+// patchPageChunk patches the compiled Next.js page chunk so that the
+// React app loads existing session messages on mount. Two patches:
+//  1. Expose the setMessages setter as window.__OP_SET_MSGS__
+//  2. After getting the sessionId from POST /api/session, also check for
+//     a "messages" field and call setMessages with it.
+func patchPageChunk(data []byte) []byte {
+	// Patch 1: before "async function y(){" insert "window.__OP_SET_MSGS__=t;"
+	data = bytes.Replace(data,
+		[]byte("null);async function y(){"),
+		[]byte("null);window.__OP_SET_MSGS__=t;async function y(){"),
+		1)
+
+	// Patch 2: after "x(t.sessionId)" add messages restoration.
+	// The inserted snippet checks t.messages (from the POST /api/session
+	// JSON response) and calls the React setter with properly formatted
+	// message objects.
+	oldP2 := []byte("x(t.sessionId)}catch(e){x(\"")
+	newP2 := []byte("x(t.sessionId);if(t.messages" +
+		"&&t.messages.length)window.__OP_SET_MSGS__(" +
+		"t.messages.map(function(m){return{id:(Date.now()+" +
+		"Math.random()).toString(36),role:m.role,content:m.content}}))" +
+		"}catch(e){x(\"")
+	data = bytes.Replace(data, oldP2, newP2, 1)
+
+	return data
 }
 
 func getContentType(ext string) string {

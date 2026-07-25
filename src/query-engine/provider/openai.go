@@ -104,6 +104,9 @@ func (p *OpenAIProvider) Stream(params queryengine.StreamParams) <-chan queryeng
 			}
 
 			for _, choice := range response.Choices {
+				if choice.Delta.ReasoningContent != "" {
+					events <- &queryengine.ThinkingDeltaEvent{Content: choice.Delta.ReasoningContent}
+				}
 				if choice.Delta.Content != "" {
 					events <- &queryengine.TextDeltaEvent{Content: choice.Delta.Content}
 				}
