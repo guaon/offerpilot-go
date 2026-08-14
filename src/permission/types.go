@@ -3,7 +3,7 @@ package permission
 type RiskLevel string
 
 const (
-	RiskLevelCritical RiskLevel = "criticsl"
+	RiskLevelCritical RiskLevel = "critical"
 	RiskLevelHigh     RiskLevel = "high"
 	RiskLevelMedium   RiskLevel = "medium"
 	RiskLevelLow      RiskLevel = "low"

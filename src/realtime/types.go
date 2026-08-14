@@ -65,37 +65,4 @@ type DefectEntry struct {
 	Suggestion  string         `json:"suggestion"`
 }
 
-type TTSProvider string //语音合成
 
-const (
-	TTSProviderBrowser   TTSProvider = "browser"
-	TTSProviderEdgeTTS   TTSProvider = "edge-tts"
-	TTSProviderOpenAITTS TTSProvider = "openai-tts"
-)
-
-type TTSConfig struct {
-	Provider TTSProvider `json:"provider"`
-	Voice    string      `json:"voice,omitempty"`
-	Speed    float64     `json:"speed,omitempty"`
-	Language string      `json:"language,omitempty"`
-}
-
-type STTProvider string //语音识别
-
-const (
-	STTProviderBrowser STTProvider = "browser"
-	STTProviderWhisper STTProvider = "whisper"
-	STTProviderFunASR  STTProvider = "funasr"
-)
-
-type STTConfig struct {
-	Provider STTProvider `json:"provider"`
-	Language string      `json:"language,omitempty"`
-	Realtime bool        `json:"realtime,omitempty"` //是否为实时模式
-}
-
-type TTSOutput struct {
-	Text     string `json:"text"`
-	AudioURL string `json:"audioUrl,omitempty"`
-	SSML     string `json:"ssml,omitempty"`
-}

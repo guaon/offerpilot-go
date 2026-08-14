@@ -21,14 +21,6 @@ type ContextLayer struct {
 	TokenCount int
 }
 
-type ContextWindow struct {
-	System     ContextLayer
-	Knowledge  ContextLayer
-	Memory     ContextLayer
-	Session    ContextLayer
-	Immediate  ContextLayer
-}
-
 type CompressionResult struct {
 	Messages        []queryengine.Message
 	Level           CompressionLevel
@@ -41,6 +33,17 @@ type AgenticCompressionResult struct {
 	Level           CompressionLevel
 	OriginalTokens  int
 	CompressedTokens int
+}
+
+// CompressedMemory holds the progressive summary of older conversation exchanges.
+// It is rebuilt each time Compress() runs by detecting an existing summary message
+// and accumulating newly evicted exchanges into it.
+type CompressedMemory struct {
+	Summary       string   `json:"summary"`
+	Topics        []string `json:"topics"`
+	Decisions     []string `json:"decisions"`
+	TechPoints    []string `json:"techPoints"`
+	ExchangeCount int      `json:"exchangeCount"`
 }
 
 type ContextWindowKey string

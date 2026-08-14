@@ -22,6 +22,8 @@ type ToolContext struct {
 	SessionId   string
 	UserID      string
 	AgentConfig interface{}
+	// OnDiagnosis is called by the record_diagnosis tool to persist scores.
+	OnDiagnosis func(sessionID string, dimension string, score int, question string)
 }
 
 type toolContextKey struct{}

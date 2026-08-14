@@ -196,11 +196,11 @@ func MockInterview() *ToolDefinition {
 	return &ToolDefinition{
 		Schema: &schema.ToolInfo{
 			Name: "mock_interview",
-			Desc: "根据 JD 和简历生成模拟面试题目序列，覆盖技术深度、项目经验、行为面试三个维度",
+			Desc: "根据 JD 和简历生成模拟面试题目序列，覆盖技术深度、项目经验、行为面试三个维度。dimension 也支持知识库分类：architecture/engineering/model/rag/multi-agent/evaluation/full-stack，此时会从知识库拉取真实面试题",
 			ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
 				"jdText":     {Type: schema.String, Desc: "JD内容（可选）"},
 				"resumeText": {Type: schema.String, Desc: "简历内容（可选）"},
-				"dimension":  {Type: schema.String, Desc: "面试维度（默认 mixed）", Enum: []string{"technical", "project", "behavioral", "mixed"}},
+				"dimension":  {Type: schema.String, Desc: "面试维度（默认 mixed）。知识库分类：architecture/engineering/model/rag/multi-agent/evaluation/full-stack", Enum: []string{"technical", "project", "behavioral", "mixed", "architecture", "engineering", "model", "rag", "multi-agent", "evaluation", "full-stack"}},
 				"difficulty": {Type: schema.String, Desc: "难度（默认 medium）", Enum: []string{"easy", "medium", "hard"}},
 				"count":      {Type: schema.Number, Desc: "题目数量（默认 5）"},
 			}),
@@ -210,6 +210,42 @@ func MockInterview() *ToolDefinition {
 			dimension := getStr(input, "dimension", "mixed")
 			difficulty := getStr(input, "difficulty", "medium")
 			count := getInt(input, "count", 5)
+
+			type qResult struct {
+				Index      int    `json:"index"`
+				Question   string `json:"question"`
+				Dimension  string `json:"dimension"`
+				Difficulty string `json:"difficulty"`
+			}
+
+			// 知识库维度：从知识库拉取真实面试题
+			kbDims := map[string]bool{
+				"architecture": true, "engineering": true, "model": true,
+				"rag": true, "multi-agent": true, "evaluation": true, "full-stack": true,
+			}
+			if kbDims[dimension] {
+				entries, err := SearchKnowledgeQuestions(dimension, count)
+				if err == nil && len(entries) > 0 {
+					results := make([]qResult, 0, len(entries))
+					for i, e := range entries {
+						q := e.Question
+						if q == "" {
+							q = e.Title
+						}
+						results = append(results, qResult{i + 1, q, dimension, difficulty})
+					}
+					data, _ := json.Marshal(map[string]interface{}{
+						"dimension":      dimension,
+						"difficulty":     difficulty,
+						"totalQuestions": len(results),
+						"question":       results,
+						"tips":           []string{"每道题用 STAR 法则组织回答", "技术题先给结论再展开", "主动提到踩坑经验和量化结果"},
+					})
+					return ToolResult{Success: true, Output: string(data)}
+				}
+				// 知识库该维度无题目，回退到 technical 硬编码题
+				dimension = "technical"
+			}
 
 			type question struct {
 				Q    string
@@ -283,13 +319,6 @@ func MockInterview() *ToolDefinition {
 				pool = pool[:count]
 			}
 
-			type qResult struct {
-				Index      int    `json:"index"`
-				Question   string `json:"question"`
-				Dimension  string `json:"dimension"`
-				Difficulty string `json:"difficulty"`
-			}
-
 			results := make([]qResult, len(pool))
 			for i, q := range pool {
 				results[i] = qResult{i + 1, q.Q, q.Dim, q.Diff}
@@ -324,4 +353,45 @@ func getInt(input map[string]interface{}, key string, defaultValue int) int {
 		return int(v)
 	}
 	return defaultValue
+}
+
+func RecordDiagnosis() *ToolDefinition {
+	return &ToolDefinition{
+		Schema: &schema.ToolInfo{
+			Name: "record_diagnosis",
+			Desc: "记录本次面试诊断结果到能力雷达。每次完成对用户回答的诊断后，必须调用此工具记录评分，以便能力雷达图持续更新",
+			ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+				"dimension": {Type: schema.String, Desc: "考察维度", Required: true, Enum: []string{"architecture", "engineering", "model", "rag", "multi-agent", "evaluation", "full-stack"}},
+				"score":     {Type: schema.Number, Desc: "评分(1-10)", Required: true},
+				"question":  {Type: schema.String, Desc: "面试问题原文", Required: true},
+			}),
+		},
+		RiskLevel: RiskLevelLow,
+		Execute: func(input map[string]interface{}, ctx ToolContext) ToolResult {
+			dimension := getStr(input, "dimension")
+			score := getInt(input, "score", 0)
+			question := getStr(input, "question")
+
+			if score < 1 {
+				score = 1
+			}
+			if score > 10 {
+				score = 10
+			}
+
+			if ctx.OnDiagnosis != nil {
+				ctx.OnDiagnosis(ctx.SessionId, dimension, score, question)
+			}
+			if RecordDiagnosisFunc != nil {
+				RecordDiagnosisFunc(ctx.SessionId, dimension, score, question)
+			}
+
+			data, _ := json.Marshal(map[string]interface{}{
+				"recorded":  true,
+				"dimension": dimension,
+				"score":     score,
+			})
+			return ToolResult{Success: true, Output: string(data)}
+		},
+	}
 }

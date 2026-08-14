@@ -380,7 +380,7 @@ func (sm *SessionManager) loadFromDB() error {
 		if userID != "" {
 			s.Metadata.UserID = userID
 		}
-		msgRows, err := sm.db.Query("SELECT role,tool_call_id,tool_calls FROM messages WHERE session_id=? ORDER BY id", id)
+		msgRows, err := sm.db.Query("SELECT role,content,tool_call_id,tool_calls FROM messages WHERE session_id=? ORDER BY id", id)
 		if err != nil {
 			return fmt.Errorf("query messages failed:%w", err)
 		}

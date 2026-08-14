@@ -12,11 +12,6 @@ import (
 
 const defaultMaxTokens = 100000
 
-type messageText struct {
-	role string
-	text string
-}
-
 type ContextManager struct {
 	maxTokens    int
 	layers       map[ContextWindowKey]*ContextLayer
@@ -110,9 +105,15 @@ func (cm *ContextManager) defaultPriority(name ContextWindowKey) int {
 	}
 }
 
+// summaryMarker prefixes the compressed-history message so it can be
+// detected and incrementally updated on subsequent Compress calls.
+const summaryMarker = "[对话历史摘要]"
+
 func (cm *ContextManager) normTarget(t int) int {
 	if t <= 0 {
-		return cm.maxTokens * 6 / 10
+		// Default working context budget: 8000 tokens (~32000 chars).
+		// This leaves room for model response (4096 tokens) and system prompt.
+		return 8000
 	}
 	return t
 }
@@ -129,38 +130,58 @@ func (cm *ContextManager) Compress(messages []queryengine.Message, targetTokens 
 	orig := cm.estimateMessagesTokens(messages)
 	if orig <= target {
 		return CompressionResult{Messages: messages, Level: CompressionLevelNone, OriginalTokens: orig, CompressedTokens: orig}
-
 	}
+
+	// 1. Detect existing progressive summary (first message starting with the marker)
+	var priorSummary string
+	startIdx := 0
+	if len(messages) > 0 && messages[0].Role == queryengine.MessageRoleUser && messages[0].Content != nil {
+		if strings.HasPrefix(*messages[0].Content, summaryMarker) {
+			priorSummary = *messages[0].Content
+			startIdx = 1
+		}
+	}
+
+	// 2. Group remaining messages into exchanges (user → assistant [+ tool results])
+	restMessages := messages[startIdx:]
+	exchanges := groupExchanges(restMessages)
+
+	// 3. Walk backwards, keep exchanges that fit within token budget
+	minKeep := 2
+	var keptExchanges [][]queryengine.Message
+	var keptTokens int
+	for i := len(exchanges) - 1; i >= 0; i-- {
+		excTokens := cm.estimateMessagesTokens(exchanges[i])
+		if keptTokens+excTokens > target && len(keptExchanges) >= minKeep {
+			break
+		}
+		keptExchanges = append([][]queryengine.Message{exchanges[i]}, keptExchanges...)
+		keptTokens += excTokens
+	}
+
+	// 4. Build progressive summary: merge prior summary with newly evicted exchanges
+	olderCount := len(exchanges) - len(keptExchanges)
+	var olderMessages []queryengine.Message
+	for i := 0; i < olderCount; i++ {
+		olderMessages = append(olderMessages, exchanges[i]...)
+	}
+
 	aggressive := float64(orig)/float64(target) >= 2
-	compressed := cm.summarizeQuery(messages, aggressive)
+	newSummary := cm.buildProgressiveSummary(priorSummary, olderMessages, aggressive)
+
+	// 5. Assemble: summary message + kept exchanges
+	var result []queryengine.Message
+	result = append(result, queryengine.Message{Role: queryengine.MessageRoleUser, Content: &newSummary})
+	for _, exc := range keptExchanges {
+		result = append(result, exc...)
+	}
+
 	return CompressionResult{
-		Messages:         compressed,
+		Messages:         result,
 		Level:            compressionLevel(aggressive),
 		OriginalTokens:   orig,
-		CompressedTokens: cm.estimateMessagesTokens(compressed),
+		CompressedTokens: cm.estimateMessagesTokens(result),
 	}
-
-}
-
-func (cm *ContextManager) CompressAsync(ctx context.Context, messages []queryengine.Message, targetTokens int) (CompressionResult, error) {
-	target := cm.normTarget(targetTokens)
-	orig := cm.estimateMessagesTokens(messages)
-	if orig <= target {
-		return CompressionResult{Messages: messages, Level: CompressionLevelNone, OriginalTokens: orig, CompressedTokens: orig}, nil
-	}
-	aggressive := float64(orig)/float64(target) >= 2
-	compressed, err := cm.llmSummarizeQuery(ctx, messages, aggressive)
-	if err != nil {
-		compressed = cm.summarizeQuery(messages, aggressive)
-	}
-
-	return CompressionResult{
-		Messages:         compressed,
-		Level:            compressionLevel(aggressive),
-		OriginalTokens:   orig,
-		CompressedTokens: cm.estimateMessagesTokens(compressed),
-	}, nil
-
 }
 
 func (cm *ContextManager) CompressAgentic(messages []*schema.AgenticMessage, targetTokens int) AgenticCompressionResult {
@@ -198,19 +219,119 @@ func (cm *ContextManager) CompressAgenticAsync(ctx context.Context, messages []*
 	}, nil
 }
 
-func (cm *ContextManager) summarizeQuery(messages []queryengine.Message, aggressive bool) []queryengine.Message {
-	keep := max(6, len(messages)*4/10)
-	if aggressive {
-		keep = 4
+// groupExchanges splits a flat message list into exchanges.
+// An exchange starts with a user message and includes everything until the next
+// user message (assistant replies + tool call/result pairs).
+func groupExchanges(messages []queryengine.Message) [][]queryengine.Message {
+	if len(messages) == 0 {
+		return nil
 	}
-	if len(messages) <= keep {
+	var exchanges [][]queryengine.Message
+	var current []queryengine.Message
+	for _, m := range messages {
+		if m.Role == queryengine.MessageRoleUser && len(current) > 0 {
+			exchanges = append(exchanges, current)
+			current = nil
+		}
+		current = append(current, m)
+	}
+	if len(current) > 0 {
+		exchanges = append(exchanges, current)
+	}
+	return exchanges
+}
+
+// buildProgressiveSummary merges a prior summary with newly evicted messages.
+func (cm *ContextManager) buildProgressiveSummary(priorSummary string, olderMessages []queryengine.Message, aggressive bool) string {
+	if len(olderMessages) == 0 {
+		if priorSummary != "" {
+			return priorSummary
+		}
+		return summaryMarker
+	}
+
+	entities := extractQueryEntities(olderMessages)
+	newPart := buildSummaryText(entities, formatQueryExchanges(olderMessages), aggressive)
+
+	if priorSummary == "" {
+		return newPart
+	}
+
+	// Merge: strip marker from prior, combine key sections
+	priorBody := strings.TrimPrefix(priorSummary, summaryMarker+"\n")
+	priorBody = strings.TrimPrefix(priorBody, summaryMarker)
+
+	// For prior summary we keep: topics, decisions, tech points
+	// For new summary we extract: topics, decisions, user preferences, recent exchanges
+	// The merged result prioritizes recent info while preserving accumulated knowledge
+
+	return summaryMarker + "\n" + mergeSummaries(priorBody, newPart, aggressive)
+}
+
+// mergeSummaries combines two summary blocks, keeping the total under ~1200 chars.
+func mergeSummaries(prior, newPart string, aggressive bool) string {
+	newBody := strings.TrimPrefix(newPart, summaryMarker+"\n")
+	newBody = strings.TrimPrefix(newBody, summaryMarker)
+
+	if aggressive {
+		// Aggressive mode: keep only the new summary + topic list from prior
+		topics := extractSection(prior, "讨论主题")
+		if topics != "" && !strings.Contains(newBody, topics) {
+			return newBody + " | 历史主题: " + topics
+		}
+		return newBody
+	}
+
+	// Non-aggressive: concatenate, truncate if too long
+	combined := prior + "\n---\n" + newBody
+	if len(combined) > 1500 {
+		// Keep last ~1000 chars + topic header from prior
+		if idx := strings.Index(prior, "\n"); idx > 0 && idx < 100 {
+			prior = prior[:idx] // just keep the first line (topic header)
+		} else if len(prior) > 200 {
+			prior = prior[:200]
+		}
+		if len(newBody) > 1000 {
+			newBody = newBody[:1000]
+		}
+		combined = prior + "\n" + newBody
+	}
+	return combined
+}
+
+// extractSection pulls a named section value from a summary string.
+func extractSection(summary, sectionName string) string {
+	prefix := sectionName + "： "
+	if idx := strings.Index(summary, prefix); idx >= 0 {
+		start := idx + len(prefix)
+		end := strings.IndexAny(summary[start:], "\n|")
+		if end < 0 {
+			return strings.TrimSpace(summary[start:])
+		}
+		return strings.TrimSpace(summary[start : start+end])
+	}
+	return ""
+}
+
+func (cm *ContextManager) summarizeQuery(messages []queryengine.Message, aggressive bool) []queryengine.Message {
+	exchanges := groupExchanges(messages)
+	if len(exchanges) <= 2 {
 		return messages
 	}
-	older, recent := messages[:len(messages)-keep], messages[len(messages)-keep:] //分割消息，older为需要压缩的消息，recent为保留的消息
 
-	entities := extractQueryEntities(older) //从older中提取关键实体，包括主题，决策和用户偏好等
-	text := buildSummaryText(entities, formatQueryExchanges(older), aggressive)
-	return append([]queryengine.Message{{Role: queryengine.MessageRoleUser, Content: &text}}, recent...)
+	// Keep last 2 exchanges, summarize the rest
+	olderMessages := make([]queryengine.Message, 0)
+	for i := 0; i < len(exchanges)-2; i++ {
+		olderMessages = append(olderMessages, exchanges[i]...)
+	}
+	recentMessages := make([]queryengine.Message, 0)
+	for i := len(exchanges) - 2; i < len(exchanges); i++ {
+		recentMessages = append(recentMessages, exchanges[i]...)
+	}
+
+	entities := extractQueryEntities(olderMessages)
+	text := buildSummaryText(entities, formatQueryExchanges(olderMessages), aggressive)
+	return append([]queryengine.Message{{Role: queryengine.MessageRoleUser, Content: &text}}, recentMessages...)
 }
 
 func (cm *ContextManager) summarizeAgentic(messages []*schema.AgenticMessage, aggressive bool) []*schema.AgenticMessage {
@@ -228,11 +349,12 @@ func (cm *ContextManager) summarizeAgentic(messages []*schema.AgenticMessage, ag
 	return append([]*schema.AgenticMessage{schema.UserAgenticMessage(text)}, recent...)
 }
 
-// ==================== summary text builder ====================将提取的关键信息和最近的对话组装成一段结构化的总结文本。
+// ==================== summary text builder ====================
 func buildSummaryText(entries keyEntities, recentExchanges string, aggressive bool) string {
 	var parts []string
+
 	if len(entries.topics) > 0 {
-		parts = append(parts, "讨论主题： "+strings.Join(entries.topics, ","))
+		parts = append(parts, "讨论主题： "+strings.Join(entries.topics, "、"))
 	}
 	if len(entries.decisions) > 0 {
 		parts = append(parts, "关键决策："+strings.Join(entries.decisions, ";"))
@@ -248,7 +370,6 @@ func buildSummaryText(entries keyEntities, recentExchanges string, aggressive bo
 		return content + "]"
 	}
 
-	//非激进模式保留用户偏好和格式化的对话文本
 	if len(entries.userPreferences) > 0 {
 		parts = append(parts, "用户偏好： "+strings.Join(entries.userPreferences, ";"))
 	}
@@ -256,8 +377,7 @@ func buildSummaryText(entries keyEntities, recentExchanges string, aggressive bo
 		parts = append(parts, "最近交流：\n"+recentExchanges)
 	}
 
-	return "[对话历史摘要]\n" + strings.Join(parts, "\n")
-
+	return summaryMarker + "\n" + strings.Join(parts, "\n")
 }
 
 // ==================== entity extraction ====================提取消息的主题，决策，用户偏好
@@ -284,32 +404,61 @@ func extractAgenticEntities(messages []*schema.AgenticMessage) keyEntities {
 	return extractKeyEntities(entries)
 }
 
+// techKeywords used by entity extraction to detect technical discussion topics.
+var techKeywords = []string{
+	"Agent", "RAG", "LLM", "embedding", "向量", "ReAct", "Tool Call", "Function Call",
+	"Prompt", "微调", "训练", "推理", "大模型", "GPT", "Claude", "LangChain",
+	"Docker", "Kubernetes", "K8s", "微服务", "架构", "分布式", "高并发",
+	"Python", "Go", "Java", "TypeScript", "Rust", "C++",
+	"PostgreSQL", "MySQL", "Redis", "MongoDB", "Elasticsearch", "Milvus",
+	"评测", "benchmark", "延迟", "QPS", "吞吐", "性能",
+	"Context Window", "Token", "Chunk", "Rerank", "HyDE",
+	"System Prompt", "Memory", "Session", "Hook", "Permission",
+	"STAR", "简历", "面试", "JD", "offer",
+}
+
 func extractKeyEntities(entries []msgEntry) keyEntities {
 	topics := make(map[string]bool)
-	var decisions, userPreferences []string
+	var decisions, userPreferences, techPoints []string
 
 	for _, e := range entries {
 		isUser := e.role == "user"
 		content := e.content
+		contentLower := strings.ToLower(content)
 
+		// Extract topics from user first-lines (keep existing logic)
 		if isUser {
 			firstLine := content
 			if idx := strings.Index(content, "\n"); idx != -1 {
 				firstLine = content[:idx]
 			}
-			if len(firstLine) > 60 {
-				firstLine = firstLine[:60]
+			if len(firstLine) > 80 {
+				firstLine = firstLine[:80]
 			}
 			if len(firstLine) > 5 {
 				topics[firstLine] = true
 			}
 		}
 
-		if strings.Contains(content, "决定") || strings.Contains(content, "选择") || strings.Contains(content, "确认") {
+		// Detect tech keywords in any message
+		for _, kw := range techKeywords {
+			kwLower := strings.ToLower(kw)
+			if strings.Contains(contentLower, kwLower) && len(kw) >= 3 {
+				topics[kw] = true
+			}
+		}
+
+		// Detect decisions by keyword
+		if strings.Contains(content, "决定") || strings.Contains(content, "选择") ||
+			strings.Contains(content, "确认") || strings.Contains(content, "采用") ||
+			strings.Contains(content, "方案是") {
 			for _, s := range strings.Split(content, "。") {
-				if strings.Contains(s, "决定") || strings.Contains(s, "选择") || strings.Contains(s, "确认") {
+				hasKeyword := strings.Contains(s, "决定") || strings.Contains(s, "选择") ||
+					strings.Contains(s, "确认") || strings.Contains(s, "采用") ||
+					strings.Contains(s, "方案是")
+				if hasKeyword {
 					s = strings.TrimSpace(s)
-					if len(s) < 100 && len(s) > 0 {
+					if len(s) < 120 && len(s) > 0 {
 						decisions = append(decisions, s)
 						if len(decisions) >= 3 {
 							break
@@ -319,11 +468,17 @@ func extractKeyEntities(entries []msgEntry) keyEntities {
 			}
 		}
 
-		if isUser && (strings.Contains(content, "我想") || strings.Contains(content, "我要") || strings.Contains(content, "我希望")) {
+		// Detect user preferences
+		if isUser && (strings.Contains(content, "我想") || strings.Contains(content, "我要") ||
+			strings.Contains(content, "我希望") || strings.Contains(content, "我需要") ||
+			strings.Contains(content, "目标是")) {
 			for _, s := range strings.Split(content, "。") {
-				if strings.Contains(s, "我想") || strings.Contains(s, "我要") || strings.Contains(s, "我希望") {
+				hasPref := strings.Contains(s, "我想") || strings.Contains(s, "我要") ||
+					strings.Contains(s, "我希望") || strings.Contains(s, "我需要") ||
+					strings.Contains(s, "目标是")
+				if hasPref {
 					s = strings.TrimSpace(s)
-					if len(s) < 80 && len(s) > 0 {
+					if len(s) < 100 && len(s) > 0 {
 						userPreferences = append(userPreferences, s)
 						if len(userPreferences) >= 3 {
 							break
@@ -332,16 +487,30 @@ func extractKeyEntities(entries []msgEntry) keyEntities {
 				}
 			}
 		}
+
+		// Detect technical details worth preserving
+		if len(content) > 60 && (strings.Contains(contentLower, "原理") ||
+			strings.Contains(contentLower, "本质") || strings.Contains(contentLower, "核心") ||
+			strings.Contains(contentLower, "关键") || strings.Contains(contentLower, "底层")) {
+			s := strings.TrimSpace(content)
+			if len(s) > 150 {
+				s = s[:150]
+			}
+			techPoints = append(techPoints, s)
+			if len(techPoints) >= 5 {
+				techPoints = techPoints[:5]
+			}
+		}
 	}
 
 	var topicList []string
 	for t := range topics {
 		topicList = append(topicList, t)
+	}
+	if len(topicList) > 8 {
+		topicList = topicList[:8]
+	}
 
-	}
-	if len(topicList) > 5 {
-		topicList = topicList[:5]
-	}
 	return keyEntities{
 		topics:          topicList,
 		decisions:       decisions,
@@ -397,38 +566,6 @@ func formatAgenticExchanges(older []*schema.AgenticMessage) string {
 		}
 	}
 	return sb.String()
-}
-
-// ==================== recent exchanges formatting ====================
-func (cm *ContextManager) llmSummarizeQuery(ctx context.Context, messages []queryengine.Message, aggressive bool) ([]queryengine.Message, error) {
-	keep := max(6, len(messages)*4/10)
-	if aggressive {
-		keep = 4
-	}
-	if len(messages) <= 4 {
-		return messages, nil
-	}
-
-	older, recent := messages[:len(messages)-keep], messages[len(messages)-keep:]
-
-	if cm.chatModel == nil {
-		return cm.summarizeQuery(messages, false), nil
-	}
-
-	entries := make([]msgEntry, 0, len(older))
-	for _, m := range older {
-		if m.Content != nil && *m.Content != "" {
-			entries = append(entries, msgEntry{role: string(m.Role), content: *m.Content})
-		}
-	}
-
-	text, err := cm.callSummaryLLM(ctx, entries, aggressive)
-	if err != nil {
-		return nil, err
-	}
-	summaryText := "[对话历史摘要]\n" + text
-	summary := queryengine.Message{Role: queryengine.MessageRoleUser, Content: &summaryText}
-	return append([]queryengine.Message{summary}, recent...), nil
 }
 
 func (cm *ContextManager) llmSummarizeAgentic(ctx context.Context, messages []*schema.AgenticMessage, aggressive bool) ([]*schema.AgenticMessage, error) {

@@ -94,6 +94,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/brand/", s.handleStaticFile)
 	mux.HandleFunc("/upload", s.handleUploadPage)
 	mux.HandleFunc("/upload.js", s.handleUploadJS)
+	mux.HandleFunc("/radar", s.handleRadar)
 	mux.HandleFunc("/", s.handleStaticOrSPA)
 
 	s.httpServer = &http.Server{
@@ -206,6 +207,9 @@ func (s *Server) handleChat(w http.ResponseWriter, req *http.Request) {
 		OnThinkingDelta: func(text string) { send(ChatEvent{Type: "thinking_delta", Content: text}) },
 		OnToolCall:      func(name string, input map[string]interface{}) { send(ChatEvent{Type: "tool_call", Name: name, Input: input}) },
 		OnToolResult:    func(name string, result string) { send(ChatEvent{Type: "tool_result", Name: name, Result: result}) },
+		OnDiagnosisRecord: func(sessionID, dimension string, score int, question string) {
+			recordDiagnosis(sessionID, dimension, score, question)
+		},
 	})
 	s.mu.Unlock()
 
@@ -639,6 +643,7 @@ type DiagnosisRecord struct {
 	Dimension string `json:"dimension"`
 	Score     int    `json:"score"`
 	Question  string `json:"question"`
+	SessionID string `json:"sessionId"`
 }
 
 type SM2State struct {
@@ -654,6 +659,56 @@ var (
 	sm2States        = make(map[string]SM2State)
 	diagnosisMu      sync.Mutex
 )
+
+// recordDiagnosis is called by the record_diagnosis tool to persist a score.
+func recordDiagnosis(sessionID, dimension string, score int, question string) {
+	diagnosisMu.Lock()
+	defer diagnosisMu.Unlock()
+
+	score = max(1, min(10, score))
+
+	record := DiagnosisRecord{
+		ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
+		Timestamp: time.Now().UnixMilli(),
+		Dimension: dimension,
+		Score:     score,
+		Question:  question,
+		SessionID: sessionID,
+	}
+	diagnosisRecords = append(diagnosisRecords, record)
+
+	existing, ok := sm2States[dimension]
+	if !ok {
+		existing = SM2State{
+			Dimension:   dimension,
+			EaseFactor:  2.5,
+			Interval:    1,
+			Repetitions: 0,
+			NextReview:  time.Now().UnixMilli(),
+		}
+	}
+
+	quality := max(0, min(5, (score*5)/10))
+	var interval int
+	if quality >= 3 {
+		if existing.Repetitions == 0 {
+			interval = 1
+		} else if existing.Repetitions == 1 {
+			interval = 3
+		} else {
+			interval = int(float64(existing.Interval) * existing.EaseFactor)
+		}
+		existing.Repetitions++
+	} else {
+		existing.Repetitions = 0
+		interval = 1
+	}
+
+	existing.EaseFactor = max(1.3, existing.EaseFactor+(0.1-float64(5-quality)*(0.08+float64(5-quality)*0.02)))
+	existing.Interval = interval
+	existing.NextReview = time.Now().UnixMilli() + int64(interval)*24*60*60*1000
+	sm2States[dimension] = existing
+}
 
 func (s *Server) handleDiagnosis(w http.ResponseWriter, req *http.Request) {
 	s.cors(w)
@@ -1894,85 +1949,6 @@ func (s *Server) handleStaticOrSPA(w http.ResponseWriter, req *http.Request) {
 	w.Write(data)
 }
 
-// buildMessageInjectionScript builds a <script> tag that restores previous
-// session messages after React finishes hydrating. Because React 18 strict
-// hydration wipes out DOM injected before it loads, we use a two-phase
-// approach: (1) embed the data as JSON, (2) wait for React to render via
-// requestAnimationFrame, then inject messages into the DOM.
-func buildMessageInjectionScript(sessionID string, msgs []*schema.Message) string {
-	type msgJSON struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	}
-	list := make([]msgJSON, 0, len(msgs))
-	for _, m := range msgs {
-		role := string(m.Role)
-		if role != "user" && role != "assistant" {
-			continue
-		}
-		if m.Content == "" {
-			continue
-		}
-		list = append(list, msgJSON{Role: role, Content: m.Content})
-	}
-	if len(list) == 0 {
-		return ""
-	}
-
-	data, _ := json.Marshal(list)
-	return `<script>` +
-		`window.__OP_MSGS__=` + string(data) + `;` +
-		`window.__OP_SID__="` + html.EscapeString(sessionID) + `";` +
-		`(function(){` +
-		`var msgs=window.__OP_MSGS__;if(!msgs||!msgs.length)return;` +
-		`function inject(){` +
-		`var container=document.querySelector('main .flex-1.overflow-y-auto .mx-auto');` +
-		`if(!container)return;` +
-		`var welcome=container.querySelector('.animate-fade-in');` +
-		`// Only inject if React has rendered (welcome is visible or messages area exists)` +
-		`if(!welcome||welcome.offsetParent===null){` +
-		`var existing=container.querySelector('[data-op-msg]');` +
-		`if(!existing)return;` +
-		`}` +
-		`if(welcome)welcome.style.display='none';` +
-		`var existing=container.querySelectorAll('[data-op-msg]');` +
-		`for(var i=0;i<existing.length;i++)existing[i].remove();` +
-		`var frag=document.createDocumentFragment();` +
-		`msgs.forEach(function(m){` +
-		`var div=document.createElement('div');` +
-		`div.className='flex '+(m.role==='user'?'justify-end':'');` +
-		`div.setAttribute('data-op-msg','1');` +
-		`if(m.role==='user'){` +
-		`div.innerHTML='<div class="flex items-start gap-3 max-w-[75%]"><div class="rounded-2xl rounded-tr-md bg-primary px-4 py-3 text-sm text-white shadow-card"><p class="whitespace-pre-wrap leading-relaxed">'+` +
-		`m.content.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</p></div></div>';` +
-		`}else{` +
-		`div.innerHTML='<div class="flex items-start gap-3 max-w-[85%]"><div class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-sky-500 to-cyan shadow-sm"><span style="color:white;font-size:12px">OP</span></div><div class="flex-1 min-w-0"><div class="rounded-2xl rounded-tl-md px-4 py-3 shadow-card border border-slate-100 bg-white"><div class="text-sm leading-relaxed text-slate-700 whitespace-pre-wrap">'+` +
-		`m.content.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</div></div></div></div>';` +
-		`}` +
-		`frag.appendChild(div);` +
-		`});` +
-		`container.appendChild(frag);` +
-		`var main=document.querySelector('main');` +
-		`if(main)main.scrollTop=main.scrollHeight;` +
-		`}` +
-		`// Wait for React hydration via double rAF, then inject.` +
-		`// Also retry on a short timer in case React is slower.` +
-		`var tries=0;` +
-		`function tryInject(){` +
-		`if(tries++>10)return;` +
-		`var ready=document.querySelector('main .flex-1.overflow-y-auto .mx-auto');` +
-		`if(!ready){setTimeout(tryInject,200);return;}` +
-		`requestAnimationFrame(function(){` +
-		`requestAnimationFrame(function(){` +
-		`inject();` +
-		`});` +
-		`});` +
-		`}` +
-		`tryInject();` +
-		`})();` +
-		`</script>`
-}
-
 // patchPageChunk patches the compiled Next.js page chunk so that the
 // React app loads existing session messages on mount. Two patches:
 //  1. Expose the setMessages setter as window.__OP_SET_MSGS__
@@ -1996,6 +1972,14 @@ func patchPageChunk(data []byte) []byte {
 		"Math.random()).toString(36),role:m.role,content:m.content}}))" +
 		"}catch(e){x(\"")
 	data = bytes.Replace(data, oldP2, newP2, 1)
+
+	// Patch 3: make the scroll-to-bottom effect also depend on the active
+	// view (h), so returning to the chat view re-scrolls to the latest
+	// message instead of staying at the top.
+	data = bytes.Replace(data,
+		[]byte("scrollIntoView({behavior:\"smooth\"})},[e]"),
+		[]byte("scrollIntoView({behavior:\"smooth\"})},[e,h]"),
+		1)
 
 	return data
 }
@@ -2202,3 +2186,4 @@ function renderDiagnosis(items){
 
 function escapeHtml(s){return (s||'').replace(/[&<>\"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 `
+

@@ -56,14 +56,16 @@ const SystemPrompt = `你是 OfferPilot，一个全链路求职辅导 Agent，�
 - 用户贴入 JD → **必须调用 analyze_jd 工具**，不要自己分析
 - 用户说"模拟面试"/"生成面试题" → **必须调用 mock_interview 工具**
 - 用户说"搜索"/"查找"面试题 → **必须调用 search_knowledge 工具**
-- 用户输入面试回答 → 诊断评分 + 追问
+- 用户输入面试回答 → 先调用 search_knowledge 搜索该题目的高手答案，诊断后必须调用 record_diagnosis 记录评分
 
 **强制规则：**
 1. 你没有实时更新的知识，必须调用工具来获取信息
 2. 分析 JD 必须用 analyze_jd 工具，工具会返回结构化数据
 3. 搜索面试题必须用 search_knowledge 工具
 4. 生成模拟面试题必须用 mock_interview 工具
-5. 禁止直接凭记忆回答，应该先调用工具`
+5. 禁止直接凭记忆回答，应该先调用工具
+6. 诊断用户回答前，必须先调用 search_knowledge 获取该题目的高手答作为对照
+7. 完成诊断后，必须调用 record_diagnosis 工具记录评分（维度+分数+题目），这会自动更新能力雷达图`
 
 type AppOptions struct {
 	Model           string
@@ -73,6 +75,8 @@ type AppOptions struct {
 	OnThinkingDelta func(text string)
 	OnToolCall      func(name string, input map[string]interface{})
 	OnToolResult    func(name string, input string)
+	// OnDiagnosisRecord is passed through to the record_diagnosis tool.
+	OnDiagnosisRecord func(sessionID string, dimension string, score int, question string)
 }
 
 type App struct {
@@ -104,6 +108,7 @@ func CreateApp(opts *AppOptions) *App {
 	toolRegistry.Registry(tool.SearchKnowledge())
 	toolRegistry.Registry(tool.AnalyzeJD())
 	toolRegistry.Registry(tool.MockInterview())
+	toolRegistry.Registry(tool.RecordDiagnosis())
 
 	logger.DefaultLogger.Info("Tools registered", map[string]interface{}{
 		"toolCount": len(toolRegistry.ListSchemas()),
@@ -111,6 +116,24 @@ func CreateApp(opts *AppOptions) *App {
 	})
 
 	permissionGate := permission.NewPermissionGate()
+
+	// Register rate limits to prevent tool-call loops.
+	// search_knowledge: max 5 calls/min (enough for multi-question diagnosis)
+	// mock_interview: max 3 calls/min (one per interview session)
+	// analyze_jd: max 5 calls/min
+	permissionGate.RegisterRule(permission.PermissionRule{
+		ToolName:           "search_knowledge",
+		RateLimitPerMinute: 5,
+	})
+	permissionGate.RegisterRule(permission.PermissionRule{
+		ToolName:           "mock_interview",
+		RateLimitPerMinute: 3,
+	})
+	permissionGate.RegisterRule(permission.PermissionRule{
+		ToolName:           "analyze_jd",
+		RateLimitPerMinute: 5,
+	})
+
 	contextManager := appcontext.NewContextManager(nil)
 
 	var sessionManager *session.SessionManager
@@ -171,12 +194,14 @@ func CreateApp(opts *AppOptions) *App {
 	var onThinkingDelta func(text string)
 	var onToolCall func(name string, input map[string]interface{})
 	var onToolResult func(name string, result string)
+	var onDiagnosisRecord func(sessionID string, dimension string, score int, question string)
 
 	if opts != nil {
 		onTextDelta = opts.OnTextDelta
 		onThinkingDelta = opts.OnThinkingDelta
 		onToolCall = opts.OnToolCall
 		onToolResult = opts.OnToolResult
+		onDiagnosisRecord = opts.OnDiagnosisRecord
 	}
 
 	agentLoop := agent.NewAgentLoop(agent.AgentConfig{
@@ -188,10 +213,13 @@ func CreateApp(opts *AppOptions) *App {
 		MemoryStore:     memStore,
 		HookPipeline:    hookPipeline,
 		DefaultModel:    defaultModel,
+		MaxIterations:   15,
+		MaxBudgetTokens: 50000,
 		OnTextDelta:     onTextDelta,
 		OnThinkingDelta: onThinkingDelta,
 		OnToolCall:      onToolCall,
 		OnToolResult:    onToolResult,
+		OnDiagnosisRecord: onDiagnosisRecord,
 	})
 
 	return &App{

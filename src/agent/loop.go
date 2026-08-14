@@ -35,6 +35,8 @@ type AgentConfig struct {
 	OnToolCall      func(name string, input map[string]interface{})
 	OnToolResult    func(toolName string, result string)
 	OnError         func(err error)
+	// OnDiagnosisRecord is passed to tools so record_diagnosis can persist scores.
+	OnDiagnosisRecord func(sessionID string, dimension string, score int, question string)
 }
 
 type AgentLoop struct {
@@ -348,6 +350,7 @@ func (al *AgentLoop) executeTool(ctx context.Context, toolCall queryengine.ToolC
 		SessionId:   sessionID,
 		UserID:      "",
 		AgentConfig: al.config,
+		OnDiagnosis: al.config.OnDiagnosisRecord,
 	})
 	elapsed := time.Since(startTime)
 
@@ -451,10 +454,33 @@ func (al *AgentLoop) convertFromQueryEngineMessages(messages []queryengine.Messa
 			role = schema.User
 		}
 
-		result = append(result, &schema.Message{
+		content := ""
+		if msg.Content != nil {
+			content = *msg.Content
+		}
+
+		m := &schema.Message{
 			Role:    role,
-			Content: *msg.Content,
-		})
+			Content: content,
+		}
+
+		if msg.ToolCallID != nil && *msg.ToolCallID != "" {
+			m.ToolCallID = *msg.ToolCallID
+		}
+		if msg.ToolCalls != nil && len(*msg.ToolCalls) > 0 {
+			toolCalls := make([]schema.ToolCall, 0, len(*msg.ToolCalls))
+			for _, tc := range *msg.ToolCalls {
+				toolCalls = append(toolCalls, schema.ToolCall{
+					ID: tc.ID,
+					Function: schema.FunctionCall{
+						Name: tc.Name,
+					},
+				})
+			}
+			m.ToolCalls = toolCalls
+		}
+
+		result = append(result, m)
 
 	}
 	return result
