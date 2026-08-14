@@ -126,6 +126,23 @@ func (sm *SessionManager) Create(userID string) *Session {
 	return s
 }
 
+// ClaimSession 将匿名会话归属到指定用户（登录认领）。
+func (sm *SessionManager) ClaimSession(sessionID, userID string) error {
+	s := sm.sessions[sessionID]
+	if s == nil {
+		return fmt.Errorf("session %s not found", sessionID)
+	}
+	s.Metadata.UserID = userID
+	s.UpdatedAt = time.Now().UnixMilli()
+
+	if sm.db != nil {
+		metadataJSON, _ := json.Marshal(s.Metadata)
+		sm.db.Exec(`UPDATE sessions SET user_id=?, metadata=?, updated_at=? WHERE id=?`,
+			userID, string(metadataJSON), s.UpdatedAt/1000, sessionID)
+	}
+	return nil
+}
+
 // 将指定会话从一个状态转换到另一个状态
 func (sm *SessionManager) Transition(id string, newState SessionState) error {
 	s := sm.sessions[id]

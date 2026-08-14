@@ -72,7 +72,7 @@ func (al *AgentLoop) GetUsage() UsageStats {
 	return al.usage
 }
 
-func (al *AgentLoop) Run(ctx context.Context, sessionID string, userMessage string) (string, error) {
+func (al *AgentLoop) Run(ctx context.Context, sessionID string, userID string, userMessage string) (string, error) {
 	config := al.config
 
 	log := logger.DefaultLogger
@@ -100,7 +100,7 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID string, userMessage stri
 		return "", err
 	}
 
-	memories := config.MemoryStore.Query(memory.MemoryQuery{SessionID: sessionID, Limit: 5})
+	memories := config.MemoryStore.Query(memory.MemoryQuery{UserID: userID, Limit: 5})
 	if len(memories) > 0 {
 		var memoryText strings.Builder
 		for _, m := range memories {

@@ -74,6 +74,7 @@ func (s *MemoryStore) Add(entry MemoryEntry) *MemoryEntry {
 	now := time.Now().UnixMilli()
 	full := &MemoryEntry{
 		ID:             uuid.New().String(),
+		UserID:         entry.UserID,
 		SessionID:      entry.SessionID,
 		Type:           entry.Type,
 		Content:        entry.Content,
@@ -86,9 +87,9 @@ func (s *MemoryStore) Add(entry MemoryEntry) *MemoryEntry {
 
 	if s.db != nil {
 		s.db.Exec(`
-		   INSERT INTO memories(id,session_id,type,content,importance,access_count,create_at,last_accessed_at)
-		   VALUES(?,?,?,?,?,?,?,?)
-		`, full.ID, full.SessionID, full.Type, full.Content, full.Importance, 0, full.CreateAt, full.LastAccessedAt)
+		   INSERT INTO memories(id,user_id,session_id,type,content,importance,access_count,create_at,last_accessed_at)
+		   VALUES(?,?,?,?,?,?,?,?,?)`,
+			full.ID, full.UserID, full.SessionID, full.Type, full.Content, full.Importance, 0, full.CreateAt, full.LastAccessedAt)
 	}
 
 	return full
@@ -97,6 +98,9 @@ func (s *MemoryStore) Add(entry MemoryEntry) *MemoryEntry {
 func (s *MemoryStore) Query(q MemoryQuery) []*MemoryEntry {
 	results := make([]*MemoryEntry, 0, len(s.entries))
 	for _, e := range s.entries {
+		if q.UserID != "" && e.UserID != q.UserID {
+			continue
+		}
 		if q.SessionID != "" && e.SessionID != q.SessionID {
 			continue
 		}

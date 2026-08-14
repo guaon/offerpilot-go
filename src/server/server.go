@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"database/sql"
 	"embed"
 	"encoding/json"
 	"encoding/xml"
@@ -19,8 +20,11 @@ import (
 	"time"
 
 	"MyOfferPilot/src/app"
+	"MyOfferPilot/src/db"
 	"MyOfferPilot/src/logger"
+	"MyOfferPilot/src/memory"
 	"MyOfferPilot/src/realtime"
+	"MyOfferPilot/src/user"
 
 	"github.com/cloudwego/eino/schema"
 	pdfreader "github.com/ledongthuc/pdf"
@@ -34,11 +38,13 @@ const (
 )
 
 type Server struct {
-	port       string
-	apiKey     string
-	httpServer *http.Server
-	app        *app.App
-	mu         sync.Mutex
+	port        string
+	apiKey      string
+	httpServer  *http.Server
+	app         *app.App
+	userService *user.Service
+	mysqlDB     *sql.DB
+	mu          sync.Mutex
 }
 
 type ChatRequest struct {
@@ -62,13 +68,33 @@ func NewServer(port string) *Server {
 	if port == "" {
 		port = "3001"
 	}
-	return &Server{
+	s := &Server{
 		port:   port,
 		apiKey: os.Getenv("OFFERPILOT_API_KEY"),
 	}
+	s.initAuth()
+	return s
+}
+
+// initAuth 初始化 MySQL 连接与用户服务。MySQL 不可用时降级为无认证模式。
+func (s *Server) initAuth() {
+	conn, err := db.Open()
+	if err != nil {
+		logger.DefaultLogger.Warn("MySQL not available, auth disabled", map[string]interface{}{"error": err.Error()})
+		return
+	}
+	if err := db.Migrate(conn); err != nil {
+		logger.DefaultLogger.Warn("MySQL migrate failed", map[string]interface{}{"error": err.Error()})
+		return
+	}
+	s.userService = user.NewService(user.NewStore(conn))
+	s.mysqlDB = conn
+	logger.DefaultLogger.Info("Auth initialized (MySQL)")
 }
 
 func (s *Server) Start() error {
+	s.loadDiagnoses()
+
 	s.mu.Lock()
 	if s.app == nil {
 		s.app = app.CreateApp(nil)
@@ -76,17 +102,23 @@ func (s *Server) Start() error {
 	s.mu.Unlock()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/chat", s.handleChat)
-	mux.HandleFunc("/api/session", s.handleSession)
-	mux.HandleFunc("/api/transcribe", s.handleTranscribe)
-	mux.HandleFunc("/api/tts", s.handleTTS)
-	mux.HandleFunc("/api/config", s.handleConfig)
-	mux.HandleFunc("/api/diagnosis", s.handleDiagnosis)
-	mux.HandleFunc("/api/interview", s.handleInterview)
-	mux.HandleFunc("/api/match", s.handleMatch)
-	mux.HandleFunc("/api/resume", s.handleResume)
-	mux.HandleFunc("/api/parse-pdf", s.handleParsePDF)
-	mux.HandleFunc("/api/parse-url", s.handleParseURL)
+	// 认证 API（公开）
+	mux.HandleFunc("/api/register", s.handleRegister)
+	mux.HandleFunc("/api/login", s.handleLogin)
+	mux.HandleFunc("/api/logout", s.handleLogout)
+	mux.HandleFunc("/api/me", s.requireAuth(s.handleMe))
+	// 业务 API（需登录）
+	mux.HandleFunc("/api/chat", s.requireAuth(s.handleChat))
+	mux.HandleFunc("/api/session", s.requireAuth(s.handleSession))
+	mux.HandleFunc("/api/transcribe", s.requireAuth(s.handleTranscribe))
+	mux.HandleFunc("/api/tts", s.requireAuth(s.handleTTS))
+	mux.HandleFunc("/api/config", s.requireAuth(s.handleConfig))
+	mux.HandleFunc("/api/diagnosis", s.requireAuth(s.handleDiagnosis))
+	mux.HandleFunc("/api/interview", s.requireAuth(s.handleInterview))
+	mux.HandleFunc("/api/match", s.requireAuth(s.handleMatch))
+	mux.HandleFunc("/api/resume", s.requireAuth(s.handleResume))
+	mux.HandleFunc("/api/parse-pdf", s.requireAuth(s.handleParsePDF))
+	mux.HandleFunc("/api/parse-url", s.requireAuth(s.handleParseURL))
 	mux.HandleFunc("/api/_next/", s.handleStaticFile)
 	mux.HandleFunc("/api/brand/", s.handleStaticFile)
 	mux.HandleFunc("/health", s.handleHealth)
@@ -199,6 +231,7 @@ func (s *Server) handleChat(w http.ResponseWriter, req *http.Request) {
 	}()
 
 	s.mu.Lock()
+	userID := userIDFromContext(req.Context())
 	appInst := app.CreateApp(&app.AppOptions{
 		Model:           chatReq.Model,
 		SessionManager:  s.app.SessionManager,
@@ -208,7 +241,7 @@ func (s *Server) handleChat(w http.ResponseWriter, req *http.Request) {
 		OnToolCall:      func(name string, input map[string]interface{}) { send(ChatEvent{Type: "tool_call", Name: name, Input: input}) },
 		OnToolResult:    func(name string, result string) { send(ChatEvent{Type: "tool_result", Name: name, Result: result}) },
 		OnDiagnosisRecord: func(sessionID, dimension string, score int, question string) {
-			recordDiagnosis(sessionID, dimension, score, question)
+			s.recordDiagnosis(userID, sessionID, dimension, score, question)
 		},
 	})
 	s.mu.Unlock()
@@ -237,7 +270,7 @@ func (s *Server) handleChat(w http.ResponseWriter, req *http.Request) {
 
 	send(ChatEvent{Type: "session", SessionID: sessionID})
 
-	_, err := appInst.Agent.Run(ctx, sessionID, chatReq.Message)
+	_, err := appInst.Agent.Run(ctx, sessionID, userID, chatReq.Message)
 	if err != nil {
 		send(ChatEvent{Type: "error", Error: err.Error()})
 		return
@@ -644,6 +677,7 @@ type DiagnosisRecord struct {
 	Score     int    `json:"score"`
 	Question  string `json:"question"`
 	SessionID string `json:"sessionId"`
+	UserID    string `json:"userId"`
 }
 
 type SM2State struct {
@@ -660,8 +694,8 @@ var (
 	diagnosisMu      sync.Mutex
 )
 
-// recordDiagnosis is called by the record_diagnosis tool to persist a score.
-func recordDiagnosis(sessionID, dimension string, score int, question string) {
+// recordDiagnosis 写内存 + MySQL 并更新 SM-2 状态。
+func (s *Server) recordDiagnosis(userID, sessionID, dimension string, score int, question string) {
 	diagnosisMu.Lock()
 	defer diagnosisMu.Unlock()
 
@@ -674,9 +708,58 @@ func recordDiagnosis(sessionID, dimension string, score int, question string) {
 		Score:     score,
 		Question:  question,
 		SessionID: sessionID,
+		UserID:    userID,
 	}
 	diagnosisRecords = append(diagnosisRecords, record)
 
+	applySM2(dimension, score)
+
+	// MySQL 落库（失败不阻塞，仅告警）
+	if s.mysqlDB != nil {
+		if _, err := s.mysqlDB.Exec(
+			`INSERT INTO diagnoses (user_id, session_id, dimension, score, question, timestamp) VALUES (?,?,?,?,?,?)`,
+			userID, sessionID, dimension, score, question, record.Timestamp,
+		); err != nil {
+			logger.DefaultLogger.Warn("insert diagnosis failed", map[string]interface{}{"error": err.Error()})
+		}
+	}
+
+	// 触发点①：规则化写入记忆（弱项/强项）
+	s.upsertDiagnosisMemory(userID, sessionID, dimension, score)
+}
+
+// upsertDiagnosisMemory 根据诊断得分规则化更新用户记忆（弱项/强项）。
+func (s *Server) upsertDiagnosisMemory(userID, sessionID, dimension string, score int) {
+	if s.app == nil || s.app.MemoryStore == nil {
+		return
+	}
+	if score < 6 {
+		s.upsertMemory(userID, sessionID, memory.MemoryTypeWeakness, dimension, score)
+	} else if score >= 7 {
+		s.upsertMemory(userID, sessionID, memory.MemoryTypeStrength, dimension, score)
+	}
+}
+
+// upsertMemory 按 user + type + 维度去重后写入一条记忆。
+func (s *Server) upsertMemory(userID, sessionID string, mtype memory.MemoryType, dimension string, score int) {
+	ms := s.app.MemoryStore
+	existing := ms.Query(memory.MemoryQuery{UserID: userID, Type: mtype})
+	for _, e := range existing {
+		if strings.Contains(e.Content, dimension) {
+			return // 已有同维度记忆，跳过
+		}
+	}
+	ms.Add(memory.MemoryEntry{
+		UserID:     userID,
+		SessionID:  sessionID,
+		Type:       mtype,
+		Content:    fmt.Sprintf("%s 维度得分 %d", dimension, score),
+		Importance: 1.0,
+	})
+}
+
+// applySM2 更新指定维度的 SM-2 间隔复习状态（内存态，需持 diagnosisMu 锁）。
+func applySM2(dimension string, score int) {
 	existing, ok := sm2States[dimension]
 	if !ok {
 		existing = SM2State{
@@ -708,6 +791,36 @@ func recordDiagnosis(sessionID, dimension string, score int, question string) {
 	existing.Interval = interval
 	existing.NextReview = time.Now().UnixMilli() + int64(interval)*24*60*60*1000
 	sm2States[dimension] = existing
+}
+
+// loadDiagnoses 从 MySQL 加载历史诊断记录到内存并重建 SM-2 状态。
+func (s *Server) loadDiagnoses() {
+	if s.mysqlDB == nil {
+		return
+	}
+
+	rows, err := s.mysqlDB.Query(
+		`SELECT user_id, session_id, dimension, score, question, timestamp FROM diagnoses ORDER BY timestamp ASC`,
+	)
+	if err != nil {
+		logger.DefaultLogger.Warn("load diagnoses failed", map[string]interface{}{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var r DiagnosisRecord
+		if err := rows.Scan(&r.UserID, &r.SessionID, &r.Dimension, &r.Score, &r.Question, &r.Timestamp); err != nil {
+			continue
+		}
+		r.ID = fmt.Sprintf("%d", r.Timestamp)
+		diagnosisRecords = append(diagnosisRecords, r)
+		applySM2(r.Dimension, r.Score)
+	}
+
+	if len(diagnosisRecords) > 0 {
+		logger.DefaultLogger.Info("diagnoses loaded from MySQL", map[string]interface{}{"count": len(diagnosisRecords)})
+	}
 }
 
 func (s *Server) handleDiagnosis(w http.ResponseWriter, req *http.Request) {
@@ -838,69 +951,23 @@ func (s *Server) handleDiagnosisPost(w http.ResponseWriter, req *http.Request) {
 		Dimension string `json:"dimension"`
 		Score     int    `json:"score"`
 		Question  string `json:"question"`
+		SessionID string `json:"sessionId"`
 	}
 
 	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid JSON"})
 		return
 	}
 
 	if body.Dimension == "" || body.Score == 0 {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "dimension and score are required"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "dimension and score are required"})
 		return
 	}
 
-	score := max(1, min(10, body.Score))
+	userID := userIDFromContext(req.Context())
+	s.recordDiagnosis(userID, body.SessionID, body.Dimension, body.Score, body.Question)
 
-	diagnosisMu.Lock()
-	defer diagnosisMu.Unlock()
-
-	record := DiagnosisRecord{
-		ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
-		Timestamp: time.Now().UnixMilli(),
-		Dimension: body.Dimension,
-		Score:     score,
-		Question:  body.Question,
-	}
-	diagnosisRecords = append(diagnosisRecords, record)
-
-	existing, ok := sm2States[body.Dimension]
-	if !ok {
-		existing = SM2State{
-			Dimension:   body.Dimension,
-			EaseFactor:  2.5,
-			Interval:    1,
-			Repetitions: 0,
-			NextReview:  time.Now().UnixMilli(),
-		}
-	}
-
-	quality := max(0, min(5, (score/10)*5))
-	var interval int
-	if quality >= 3 {
-		if existing.Repetitions == 0 {
-			interval = 1
-		} else if existing.Repetitions == 1 {
-			interval = 3
-		} else {
-			interval = int(float64(existing.Interval) * existing.EaseFactor)
-		}
-		existing.Repetitions++
-	} else {
-		existing.Repetitions = 0
-		interval = 1
-	}
-
-	existing.EaseFactor = max(1.3, existing.EaseFactor+(0.1-float64(5-quality)*(0.08+float64(5-quality)*0.02)))
-	existing.Interval = interval
-	existing.NextReview = time.Now().UnixMilli() + int64(interval)*24*60*60*1000
-	sm2States[body.Dimension] = existing
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "record": record})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 type InterviewSession struct {

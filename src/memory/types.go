@@ -11,21 +11,23 @@ const (
 
 )
 
-type MemoryEntry struct{
-	ID string `json:"id"`
-	SessionID string `json:"sessionID"`
-	Type MemoryType `json:"type"`
-	Content string `json:"content"`
-	Importance float64 `json:"importance"`
-	CreateAt int64 `json:"createAt"`
-	LastAccessedAt int64 `json:"lastAccessedAt"`
-	AccessCount int `json:"accessCount"`
+type MemoryEntry struct {
+	ID            string     `json:"id"`
+	UserID        string     `json:"userId"`
+	SessionID     string     `json:"sessionID"`
+	Type          MemoryType `json:"type"`
+	Content       string     `json:"content"`
+	Importance    float64    `json:"importance"`
+	CreateAt      int64      `json:"createAt"`
+	LastAccessedAt int64     `json:"lastAccessedAt"`
+	AccessCount   int        `json:"accessCount"`
 }
 
-type MemoryQuery struct{
-	SessionID string
-	Type MemoryType
-	Query string
-	Limit int
+type MemoryQuery struct {
+	UserID        string
+	SessionID     string
+	Type          MemoryType
+	Query         string
+	Limit         int
 	MinImportance float64
 }
