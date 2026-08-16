@@ -110,6 +110,7 @@ func (s *Server) Start() error {
 	// 业务 API（需登录）
 	mux.HandleFunc("/api/chat", s.requireAuth(s.handleChat))
 	mux.HandleFunc("/api/session", s.requireAuth(s.handleSession))
+	mux.HandleFunc("/api/session/new", s.requireAuth(s.handleSessionNew))
 	mux.HandleFunc("/api/transcribe", s.requireAuth(s.handleTranscribe))
 	mux.HandleFunc("/api/tts", s.requireAuth(s.handleTTS))
 	mux.HandleFunc("/api/config", s.requireAuth(s.handleConfig))
@@ -127,6 +128,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/upload", s.handleUploadPage)
 	mux.HandleFunc("/upload.js", s.handleUploadJS)
 	mux.HandleFunc("/radar", s.handleRadar)
+	mux.HandleFunc("/login", s.handleLoginPage)
 	mux.HandleFunc("/", s.handleStaticOrSPA)
 
 	s.httpServer = &http.Server{
@@ -270,10 +272,20 @@ func (s *Server) handleChat(w http.ResponseWriter, req *http.Request) {
 
 	send(ChatEvent{Type: "session", SessionID: sessionID})
 
+	// 加载第二层画像（知识点 + 求职信息）到内存缓存
+	if userID != "" {
+		s.loadProfile(userID)
+	}
+
 	_, err := appInst.Agent.Run(ctx, sessionID, userID, chatReq.Message)
 	if err != nil {
 		send(ChatEvent{Type: "error", Error: err.Error()})
 		return
+	}
+
+	// 每轮对话后，把规则提取到的求职信息同步到 user_profiles
+	if userID != "" {
+		s.saveUserProfileFromMemory(userID)
 	}
 
 	usage := appInst.Agent.GetUsage()
@@ -289,6 +301,34 @@ func (s *Server) handleChat(w http.ResponseWriter, req *http.Request) {
 
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
+}
+
+// handleSessionNew 创建全新的对话会话（新会话功能入口）。
+func (s *Server) handleSessionNew(w http.ResponseWriter, req *http.Request) {
+	s.cors(w)
+
+	if req.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if req.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := userIDFromContext(req.Context())
+	session := s.app.SessionManager.Create(userID)
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "offerpilot_sid",
+		Value:    session.ID,
+		Path:     "/",
+		HttpOnly: false,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   86400 * 30,
+	})
+
+	writeJSON(w, http.StatusOK, map[string]string{"sessionId": session.ID})
 }
 
 func (s *Server) handleSession(w http.ResponseWriter, req *http.Request) {
@@ -726,6 +766,139 @@ func (s *Server) recordDiagnosis(userID, sessionID, dimension string, score int,
 
 	// 触发点①：规则化写入记忆（弱项/强项）
 	s.upsertDiagnosisMemory(userID, sessionID, dimension, score)
+
+	// 更新第一层活性画像（内存）
+	s.updateActiveProfile(dimension, question)
+
+	// 更新第二层知识点（MySQL + 缓存）
+	s.saveKnowledgePoint(userID, dimension, score)
+}
+
+// updateActiveProfile 更新第一层活性画像（面试状态机）。
+func (s *Server) updateActiveProfile(dimension, question string) {
+	if s.app == nil || s.app.MemoryStore == nil {
+		return
+	}
+	ap := s.app.MemoryStore.GetActiveProfile()
+	ap.CurrentTopic = dimension
+	ap.CurrentQuestion = question
+	ap.QuestionIndex++
+	s.app.MemoryStore.UpdateActiveProfile(*ap)
+}
+
+// saveKnowledgePoint 更新第二层知识点掌握情况（MySQL + 内存缓存）。
+func (s *Server) saveKnowledgePoint(userID, pointName string, score int) {
+	mastered := score >= 6
+	now := time.Now().UnixMilli()
+
+	// 更新内存缓存
+	if s.app != nil && s.app.MemoryStore != nil {
+		points := s.app.MemoryStore.GetKnowledgePoints()
+		found := false
+		for i := range points {
+			if points[i].UserID == userID && points[i].PointName == pointName {
+				points[i].Score = score
+				points[i].Mastered = mastered
+				points[i].UpdatedAt = now
+				found = true
+				break
+			}
+		}
+		if !found {
+			points = append(points, memory.KnowledgePoint{
+				UserID: userID, PointName: pointName, Score: score, Mastered: mastered, UpdatedAt: now,
+			})
+		}
+		s.app.MemoryStore.SetKnowledgePoints(points)
+	}
+
+	// 写 MySQL
+	if s.mysqlDB != nil {
+		if _, err := s.mysqlDB.Exec(
+			`INSERT INTO knowledge_points (user_id, point_name, score, mastered, updated_at) VALUES (?,?,?,?,?)
+			 ON DUPLICATE KEY UPDATE score=VALUES(score), mastered=VALUES(mastered), updated_at=VALUES(updated_at)`,
+			userID, pointName, score, mastered, now,
+		); err != nil {
+			logger.DefaultLogger.Warn("save knowledge point failed", map[string]interface{}{"error": err.Error()})
+		}
+	}
+}
+
+// loadProfile 从 MySQL 加载第二层画像（知识点 + 求职信息）到内存缓存。
+func (s *Server) loadProfile(userID string) {
+	if s.mysqlDB == nil || s.app == nil || s.app.MemoryStore == nil {
+		return
+	}
+	ms := s.app.MemoryStore
+
+	// 加载知识点
+	if rows, err := s.mysqlDB.Query(
+		`SELECT user_id, point_name, score, mastered, updated_at FROM knowledge_points WHERE user_id = ? ORDER BY updated_at DESC`,
+		userID,
+	); err == nil {
+		var points []memory.KnowledgePoint
+		for rows.Next() {
+			var p memory.KnowledgePoint
+			var mastered int
+			if rows.Scan(&p.UserID, &p.PointName, &p.Score, &mastered, &p.UpdatedAt) == nil {
+				p.Mastered = mastered == 1
+				points = append(points, p)
+			}
+		}
+		rows.Close()
+		ms.SetKnowledgePoints(points)
+	}
+
+	// 加载求职信息
+	var p memory.StructuredProfile
+	var dir, pos, sit sql.NullString
+	err := s.mysqlDB.QueryRow(
+		`SELECT job_direction, target_position, current_situation, updated_at FROM user_profiles WHERE user_id = ?`,
+		userID,
+	).Scan(&dir, &pos, &sit, &p.UpdatedAt)
+	if err == nil {
+		p.UserID = userID
+		p.JobDirection = dir.String
+		p.TargetPosition = pos.String
+		p.CurrentSituation = sit.String
+		ms.SetProfile(&p)
+	}
+}
+
+// saveUserProfileFromMemory 从内存记忆（face/preference）提取求职信息，写 user_profiles。
+func (s *Server) saveUserProfileFromMemory(userID string) {
+	if s.app == nil || s.app.MemoryStore == nil || s.mysqlDB == nil {
+		return
+	}
+	ms := s.app.MemoryStore
+
+	var jobDirection, targetPosition, situation string
+	all := ms.Query(memory.MemoryQuery{UserID: userID})
+	for _, m := range all {
+		switch {
+		case strings.Contains(m.Content, "求职方向"):
+			jobDirection = strings.TrimPrefix(m.Content, "求职方向: ")
+		case strings.Contains(m.Content, "求职目标"):
+			targetPosition = strings.TrimPrefix(m.Content, "求职目标: ")
+		case strings.Contains(m.Content, "技术栈"),
+			strings.Contains(m.Content, "工作年限"),
+			strings.Contains(m.Content, "自我介绍"),
+			strings.Contains(m.Content, "姓名"):
+			if situation != "" {
+				situation += "；"
+			}
+			situation += m.Content
+		}
+	}
+
+	now := time.Now().UnixMilli()
+	if _, err := s.mysqlDB.Exec(
+		`INSERT INTO user_profiles (user_id, job_direction, target_position, current_situation, updated_at) VALUES (?,?,?,?,?)
+		 ON DUPLICATE KEY UPDATE job_direction=VALUES(job_direction), target_position=VALUES(target_position), current_situation=VALUES(current_situation), updated_at=VALUES(updated_at)`,
+		userID, jobDirection, targetPosition, situation, now,
+	); err != nil {
+		logger.DefaultLogger.Warn("save user profile failed", map[string]interface{}{"error": err.Error()})
+	}
 }
 
 // upsertDiagnosisMemory 根据诊断得分规则化更新用户记忆（弱项/强项）。
@@ -1983,6 +2156,31 @@ func (s *Server) handleStaticFile(w http.ResponseWriter, req *http.Request) {
 	w.Write(data)
 }
 
+// authScript 注入到 index.html，根据登录状态动态切换 header 中的登录按钮。
+const authScript = `<script>
+(function(){
+  var user=null;
+  function apply(){
+    var el=document.getElementById('auth-link');
+    if(!el) return;
+    if(user && user.username){
+      el.textContent=user.username;
+      el.title='已登录';
+    }else{
+      el.textContent='登录';
+      el.title='';
+    }
+  }
+  fetch('/api/me',{credentials:'include'}).then(function(r){if(r.ok)return r.json();return null;}).then(function(d){if(d&&d.username){user=d;}apply();}).catch(function(){});
+  setInterval(apply,2000);
+})();
+</script>`
+
+// injectAuthScript 在 index.html 的 </body> 前注入登录状态脚本。
+func injectAuthScript(data []byte) []byte {
+	return bytes.Replace(data, []byte("</body>"), []byte(authScript+"</body>"), 1)
+}
+
 func (s *Server) handleStaticOrSPA(w http.ResponseWriter, req *http.Request) {
 	if req.URL.Path == "/" {
 		data, err := webFiles.ReadFile("web/index.html")
@@ -1992,7 +2190,7 @@ func (s *Server) handleStaticOrSPA(w http.ResponseWriter, req *http.Request) {
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		w.Write(data)
+		w.Write(injectAuthScript(data))
 		return
 	}
 
@@ -2006,7 +2204,7 @@ func (s *Server) handleStaticOrSPA(w http.ResponseWriter, req *http.Request) {
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		w.Write(data)
+		w.Write(injectAuthScript(data))
 		return
 	}
 
@@ -2046,6 +2244,19 @@ func patchPageChunk(data []byte) []byte {
 	data = bytes.Replace(data,
 		[]byte("scrollIntoView({behavior:\"smooth\"})},[e]"),
 		[]byte("scrollIntoView({behavior:\"smooth\"})},[e,h]"),
+		1)
+
+	// Patch 4: make "new session" (onReset) call /api/session/new so it
+	// starts a fresh chat instead of reusing the cookie session.
+	data = bytes.Replace(data,
+		[]byte("onReset:function(){t([]),y()}"),
+		[]byte("onReset:function(){t([]),fetch(\"/api/session/new\",{method:\"POST\"}).then(function(e){return e.json()}).then(function(d){x(d.sessionId)})}"),
+		1)
+
+	// Patch 5: add a "登录" link next to the "新会话" button in the header.
+	data = bytes.Replace(data,
+		[]byte("新会话\"]})"),
+		[]byte("新会话\"]}),(0,a.jsx)(\"a\",{id:\"auth-link\",href:\"/login\",style:{textDecoration:\"none\"},className:\"flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs text-slate-500 hover:bg-slate-100 hover:text-primary transition-all\",children:\"登录\"})"),
 		1)
 
 	return data

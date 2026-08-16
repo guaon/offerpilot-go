@@ -10,8 +10,11 @@ import (
 )
 
 type MemoryStore struct {
-	entries []*MemoryEntry
-	db      *sql.DB
+	entries         []*MemoryEntry
+	db              *sql.DB
+	active          *ActiveProfile      // 第一层活性画像（内存态）
+	knowledgePoints []KnowledgePoint     // 第二层知识点缓存
+	profile         *StructuredProfile   // 第二层结构化画像缓存
 }
 
 func NewMemoryStore(dpPath string) (*MemoryStore, error) {
@@ -34,8 +37,10 @@ func NewMemoryStore(dpPath string) (*MemoryStore, error) {
 	}
 
 	store := &MemoryStore{
-		db:      db,
-		entries: make([]*MemoryEntry, 0),
+		db:              db,
+		entries:         make([]*MemoryEntry, 0),
+		active:          &ActiveProfile{},
+		knowledgePoints: make([]KnowledgePoint, 0),
 	}
 	if db != nil {
 		if err := store.loadFromDB(); err != nil {
@@ -209,4 +214,38 @@ func (s *MemoryStore) loadFromDB() error {
 	}
 
 	return rows.Err()
+}
+
+// GetActiveProfile 返回第一层活性画像（内存态）。
+func (s *MemoryStore) GetActiveProfile() *ActiveProfile {
+	if s.active == nil {
+		s.active = &ActiveProfile{}
+	}
+	return s.active
+}
+
+// UpdateActiveProfile 更新第一层活性画像。
+func (s *MemoryStore) UpdateActiveProfile(ap ActiveProfile) {
+	ap.UpdatedAt = time.Now().UnixMilli()
+	s.active = &ap
+}
+
+// GetKnowledgePoints 返回第二层知识点缓存。
+func (s *MemoryStore) GetKnowledgePoints() []KnowledgePoint {
+	return s.knowledgePoints
+}
+
+// SetKnowledgePoints 设置第二层知识点缓存。
+func (s *MemoryStore) SetKnowledgePoints(points []KnowledgePoint) {
+	s.knowledgePoints = points
+}
+
+// GetProfile 返回第二层结构化画像缓存。
+func (s *MemoryStore) GetProfile() *StructuredProfile {
+	return s.profile
+}
+
+// SetProfile 设置第二层结构化画像缓存。
+func (s *MemoryStore) SetProfile(p *StructuredProfile) {
+	s.profile = p
 }

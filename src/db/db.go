@@ -95,6 +95,24 @@ func Migrate(conn *sql.DB) error {
 			INDEX idx_user (user_id),
 			INDEX idx_dimension (dimension)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+		`CREATE TABLE IF NOT EXISTS user_profiles (
+			user_id           VARCHAR(64) PRIMARY KEY,
+			job_direction     VARCHAR(255) DEFAULT NULL,
+			target_position   VARCHAR(255) DEFAULT NULL,
+			current_situation VARCHAR(512) DEFAULT NULL,
+			updated_at        BIGINT NOT NULL
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+		`CREATE TABLE IF NOT EXISTS knowledge_points (
+			id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+			user_id    VARCHAR(64) NOT NULL,
+			point_name VARCHAR(128) NOT NULL,
+			score      INT NOT NULL,
+			mastered   TINYINT NOT NULL DEFAULT 0,
+			updated_at BIGINT NOT NULL,
+			UNIQUE KEY uk_user_point (user_id, point_name)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 	}
 
 	for _, q := range queries {

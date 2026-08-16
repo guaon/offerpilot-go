@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -13,7 +15,6 @@ import (
 	queryengine "MyOfferPilot/src/query-engine"
 	"MyOfferPilot/src/session"
 	tool "MyOfferPilot/src/tools"
-	"encoding/json"
 
 	"github.com/cloudwego/eino/schema"
 )
@@ -100,17 +101,61 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID string, userID string, u
 		return "", err
 	}
 
+	// 规则化画像提取：实时写入用户画像（零 LLM 成本）
+	al.extractProfile(userID, sessionID, userMessage)
+
+	// 组装两层画像 + 历史记忆，注入 System Prompt
+	var profileText strings.Builder
+
+	// 第二层：结构化画像（求职信息）
+	if p := config.MemoryStore.GetProfile(); p != nil {
+		if p.JobDirection != "" || p.TargetPosition != "" || p.CurrentSituation != "" {
+			profileText.WriteString("【用户结构化画像】\n")
+			if p.JobDirection != "" {
+				profileText.WriteString("求职方向：" + p.JobDirection + "\n")
+			}
+			if p.TargetPosition != "" {
+				profileText.WriteString("目标岗位：" + p.TargetPosition + "\n")
+			}
+			if p.CurrentSituation != "" {
+				profileText.WriteString("当前情况：" + p.CurrentSituation + "\n")
+			}
+		}
+	}
+
+	// 第二层：知识点掌握情况
+	if points := config.MemoryStore.GetKnowledgePoints(); len(points) > 0 {
+		profileText.WriteString("【知识点掌握情况】\n")
+		for _, p := range points {
+			status := "未掌握"
+			if p.Mastered {
+				status = "已掌握"
+			}
+			profileText.WriteString(fmt.Sprintf("- %s：%d分（%s）\n", p.PointName, p.Score, status))
+		}
+	}
+
+	// 第一层：活性画像（当前面试状态）
+	if ap := config.MemoryStore.GetActiveProfile(); ap != nil && ap.CurrentTopic != "" {
+		profileText.WriteString("【当前面试状态】\n")
+		profileText.WriteString(fmt.Sprintf("- 第%d题，考察：%s，题目：%s\n", ap.QuestionIndex, ap.CurrentTopic, ap.CurrentQuestion))
+	}
+
+	// 历史记忆（weakness/strength/face/preference）
 	memories := config.MemoryStore.Query(memory.MemoryQuery{UserID: userID, Limit: 5})
 	if len(memories) > 0 {
-		var memoryText strings.Builder
+		profileText.WriteString("【历史记忆】\n")
 		for _, m := range memories {
-			memoryText.WriteString("- [")
-			memoryText.WriteString(string(m.Type))
-			memoryText.WriteString("] ")
-			memoryText.WriteString(m.Content)
-			memoryText.WriteString("\n")
+			profileText.WriteString("- [")
+			profileText.WriteString(string(m.Type))
+			profileText.WriteString("] ")
+			profileText.WriteString(m.Content)
+			profileText.WriteString("\n")
 		}
-		config.ContextManager.SetLayer(appcontext.ContextWindowKeyMemory, "User context:\n"+memoryText.String(), -1)
+	}
+
+	if profileText.Len() > 0 {
+		config.ContextManager.SetLayer(appcontext.ContextWindowKeyMemory, profileText.String(), -1)
 	}
 
 	systemPrompt := config.ContextManager.BuildSystemPrompt()
@@ -543,6 +588,87 @@ func formatToolInput(input map[string]interface{}) string {
 	s := string(b)
 	if len(s) > 500 {
 		return s[:500] + "...(truncated)"
+	}
+	return s
+}
+
+// extractProfile 规则化提取用户画像并实时写入记忆（零 LLM 成本）。
+// 检测“我想面 X / 目标是 X / 我熟悉 X”等模式，写入 preference/face。
+func (al *AgentLoop) extractProfile(userID, sessionID, userMessage string) {
+	ms := al.config.MemoryStore
+	if ms == nil {
+		return
+	}
+
+	type rule struct {
+		pattern string
+		mtype   memory.MemoryType
+		label   string
+	}
+	rules := []rule{
+		{"我叫", memory.MemoryTypeFace, "姓名"},
+		{"我的名字", memory.MemoryTypeFace, "姓名"},
+		{"名字是", memory.MemoryTypeFace, "姓名"},
+		{"我是", memory.MemoryTypeFace, "自我介绍"},
+		{"我想面", memory.MemoryTypePreference, "求职方向"},
+		{"求职方向", memory.MemoryTypePreference, "求职方向"},
+		{"想应聘", memory.MemoryTypePreference, "求职方向"},
+		{"岗位是", memory.MemoryTypePreference, "求职方向"},
+		{"目标是", memory.MemoryTypePreference, "求职目标"},
+		{"我熟悉", memory.MemoryTypeFace, "技术栈"},
+		{"我精通", memory.MemoryTypeFace, "技术栈"},
+		{"我用过", memory.MemoryTypeFace, "技术栈"},
+		{"主要用", memory.MemoryTypeFace, "技术栈"},
+		{"目标职级", memory.MemoryTypeFace, "目标职级"},
+		{"年经验", memory.MemoryTypeFace, "工作年限"},
+	}
+
+	for _, r := range rules {
+		idx := strings.Index(userMessage, r.pattern)
+		if idx < 0 {
+			continue
+		}
+		snippet := extractProfileSnippet(userMessage, idx)
+		if snippet == "" {
+			continue
+		}
+		content := r.label + ": " + snippet
+
+		// 去重：已有同 user 同 type 同内容则跳过
+		existing := ms.Query(memory.MemoryQuery{UserID: userID, Type: r.mtype})
+		dup := false
+		for _, e := range existing {
+			if strings.Contains(e.Content, snippet) {
+				dup = true
+				break
+			}
+		}
+		if dup {
+			continue
+		}
+
+		ms.Add(memory.MemoryEntry{
+			UserID:     userID,
+			SessionID:  sessionID,
+			Type:       r.mtype,
+			Content:    content,
+			Importance: 1.0,
+		})
+	}
+}
+
+// extractProfileSnippet 截取关键词后的片段（到标点或换行，最多 50 字）。
+func extractProfileSnippet(msg string, start int) string {
+	s := msg[start:]
+	if idx := strings.IndexAny(s, "\n。！？!?；;，,"); idx > 0 {
+		s = s[:idx]
+	}
+	s = strings.TrimSpace(s)
+	if len(s) > 50 {
+		s = s[:50]
+	}
+	if len(s) < 3 {
+		return ""
 	}
 	return s
 }

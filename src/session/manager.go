@@ -417,7 +417,7 @@ func (sm *SessionManager) loadFromDB() error {
 
 			if toolCallsJSON != "" {
 				var toolCalls []schema.ToolCall
-				if err := json.Unmarshal([]byte(toolCallsJSON), &toolCalls); err != nil {
+				if err := json.Unmarshal([]byte(toolCallsJSON), &toolCalls); err == nil {
 					msg.ToolCalls = toolCalls
 				}
 

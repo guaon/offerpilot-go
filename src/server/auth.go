@@ -20,29 +20,25 @@ func userIDFromContext(ctx context.Context) string {
 	return ""
 }
 
-// requireAuth 校验登录态，通过后把 userID 写入请求上下文。
+// requireAuth 尽力认证：有有效登录 cookie 则注入 userID（用于记忆/诊断隔离），
+// 无 cookie 也放行（未登录可对话，仅 /api/me 等需用户信息的接口会另行拦截）。
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
-		// 未初始化 MySQL / userService 时降级为放行（兼容无认证环境）
 		if s.userService == nil {
 			next(w, req)
 			return
 		}
 
-		c, err := req.Cookie(authCookieName)
-		if err != nil || c.Value == "" {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-			return
+		if c, err := req.Cookie(authCookieName); err == nil && c.Value != "" {
+			if u, err := s.userService.ValidateSession(c.Value); err == nil && u != nil {
+				ctx := context.WithValue(req.Context(), ctxKeyUserID, u.ID)
+				next(w, req.WithContext(ctx))
+				return
+			}
 		}
 
-		u, err := s.userService.ValidateSession(c.Value)
-		if err != nil || u == nil {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-			return
-		}
-
-		ctx := context.WithValue(req.Context(), ctxKeyUserID, u.ID)
-		next(w, req.WithContext(ctx))
+		// 未登录：放行，userID 为空
+		next(w, req)
 	}
 }
 

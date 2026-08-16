@@ -200,7 +200,7 @@ func MockInterview() *ToolDefinition {
 			ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
 				"jdText":     {Type: schema.String, Desc: "JD内容（可选）"},
 				"resumeText": {Type: schema.String, Desc: "简历内容（可选）"},
-				"dimension":  {Type: schema.String, Desc: "面试维度（默认 mixed）。知识库分类：architecture/engineering/model/rag/multi-agent/evaluation/full-stack", Enum: []string{"technical", "project", "behavioral", "mixed", "architecture", "engineering", "model", "rag", "multi-agent", "evaluation", "full-stack"}},
+				"dimension":  {Type: schema.String, Desc: "面试维度（默认 mixed）。agent 方向用 agent（聚合 architecture+engineering+multi-agent）。知识库分类：architecture/engineering/model/rag/multi-agent/evaluation/full-stack", Enum: []string{"agent", "technical", "project", "behavioral", "mixed", "architecture", "engineering", "model", "rag", "multi-agent", "evaluation", "full-stack"}},
 				"difficulty": {Type: schema.String, Desc: "难度（默认 medium）", Enum: []string{"easy", "medium", "hard"}},
 				"count":      {Type: schema.Number, Desc: "题目数量（默认 5）"},
 			}),
@@ -223,16 +223,36 @@ func MockInterview() *ToolDefinition {
 				"architecture": true, "engineering": true, "model": true,
 				"rag": true, "multi-agent": true, "evaluation": true, "full-stack": true,
 			}
-			if kbDims[dimension] {
-				entries, err := SearchKnowledgeQuestions(dimension, count)
-				if err == nil && len(entries) > 0 {
+			if dimension == "agent" || kbDims[dimension] {
+				var entries []KnowledgeEntry
+				if dimension == "agent" {
+					// 聚合 architecture + engineering + multi-agent
+					for _, dim := range []string{"architecture", "engineering", "multi-agent"} {
+						sub, _ := SearchKnowledgeQuestions(dim, count)
+						entries = append(entries, sub...)
+						if len(entries) >= count {
+							break
+						}
+					}
+					if len(entries) > count {
+						entries = entries[:count]
+					}
+				} else {
+					entries, _ = SearchKnowledgeQuestions(dimension, count)
+				}
+
+				if len(entries) > 0 {
 					results := make([]qResult, 0, len(entries))
 					for i, e := range entries {
 						q := e.Question
 						if q == "" {
 							q = e.Title
 						}
-						results = append(results, qResult{i + 1, q, dimension, difficulty})
+						dim := e.Dimension
+						if dim == "" {
+							dim = dimension
+						}
+						results = append(results, qResult{i + 1, q, dim, difficulty})
 					}
 					data, _ := json.Marshal(map[string]interface{}{
 						"dimension":      dimension,

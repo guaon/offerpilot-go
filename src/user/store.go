@@ -31,12 +31,19 @@ func NewStore(db *sql.DB) *Store {
 	return &Store{db: db}
 }
 
-// CreateUser 插入新用户。username/email 唯一冲突时返回错误。
+// CreateUser 插入新用户。username/email 唯一冲突时返回错误。空 email 存 NULL。
 func (s *Store) CreateUser(id, username, email, passwordHash string, now int64) (*User, error) {
+	var emailArg interface{}
+	if email == "" {
+		emailArg = nil
+	} else {
+		emailArg = email
+	}
+
 	_, err := s.db.Exec(
 		`INSERT INTO users (id, username, email, password_hash, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
-		id, username, email, passwordHash, now, now,
+		id, username, emailArg, passwordHash, now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert user: %w", err)
@@ -68,8 +75,9 @@ func (s *Store) GetUserByID(id string) (*User, error) {
 
 func (s *Store) queryUser(query string, arg string) (*User, error) {
 	var u User
+	var email sql.NullString
 	err := s.db.QueryRow(query, arg).Scan(
-		&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.CreatedAt, &u.UpdatedAt,
+		&u.ID, &u.Username, &email, &u.PasswordHash, &u.CreatedAt, &u.UpdatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -77,6 +85,7 @@ func (s *Store) queryUser(query string, arg string) (*User, error) {
 	if err != nil {
 		return nil, fmt.Errorf("query user: %w", err)
 	}
+	u.Email = email.String
 	return &u, nil
 }
 
