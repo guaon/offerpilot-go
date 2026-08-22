@@ -38,6 +38,8 @@ type AgentConfig struct {
 	OnError         func(err error)
 	// OnDiagnosisRecord is passed to tools so record_diagnosis can persist scores.
 	OnDiagnosisRecord func(sessionID string, dimension string, score int, question string)
+	// OnInterviewQuestions is passed to mock_interview to persist the question sequence.
+	OnInterviewQuestions func(questions []string)
 }
 
 type AgentLoop struct {
@@ -135,10 +137,24 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID string, userID string, u
 		}
 	}
 
-	// 第一层：活性画像（当前面试状态）
-	if ap := config.MemoryStore.GetActiveProfile(); ap != nil && ap.CurrentTopic != "" {
-		profileText.WriteString("【当前面试状态】\n")
-		profileText.WriteString(fmt.Sprintf("- 第%d题，考察：%s，题目：%s\n", ap.QuestionIndex, ap.CurrentTopic, ap.CurrentQuestion))
+	// 第一层：活性画像（面试题目序列 + 当前进度）
+	if ap := config.MemoryStore.GetActiveProfile(); ap != nil {
+		if len(ap.Questions) > 0 {
+			profileText.WriteString("【本次面试题目序列】\n")
+			for i, q := range ap.Questions {
+				marker := ""
+				if i < ap.QuestionIndex {
+					marker = "（已答）"
+				} else if i == ap.QuestionIndex {
+					marker = "（下一题）"
+				}
+				profileText.WriteString(fmt.Sprintf("%d. %s%s\n", i+1, q, marker))
+			}
+			// 明确告诉模型下一题是什么
+			if ap.QuestionIndex < len(ap.Questions) {
+				profileText.WriteString(fmt.Sprintf("下一题是第 %d 题：%s\n", ap.QuestionIndex+1, ap.Questions[ap.QuestionIndex]))
+			}
+		}
 	}
 
 	// 历史记忆（weakness/strength/face/preference）
@@ -392,10 +408,11 @@ func (al *AgentLoop) executeTool(ctx context.Context, toolCall queryengine.ToolC
 
 	startTime := time.Now()
 	result, err := al.config.ToolRegistry.ExecuteJSON(ctx, toolCall.Name, string(inputJSON), tool.ToolContext{
-		SessionId:   sessionID,
-		UserID:      "",
-		AgentConfig: al.config,
-		OnDiagnosis: al.config.OnDiagnosisRecord,
+		SessionId:            sessionID,
+		UserID:               "",
+		AgentConfig:          al.config,
+		OnDiagnosis:          al.config.OnDiagnosisRecord,
+		OnInterviewQuestions: al.config.OnInterviewQuestions,
 	})
 	elapsed := time.Since(startTime)
 

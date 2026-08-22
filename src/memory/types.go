@@ -38,6 +38,7 @@ type ActiveProfile struct {
 	CurrentTopic    string   `json:"currentTopic"`    // 当前考察知识点（如 RAG）
 	CurrentQuestion string   `json:"currentQuestion"` // 当前题目
 	QuestionIndex   int      `json:"questionIndex"`   // 第几题（从 1 开始）
+	Questions       []string `json:"questions"`       // 本次面试完整题目序列（mock_interview 生成）
 	StuckPoints     []string `json:"stuckPoints"`     // 卡顿的知识点
 	ExpressionNotes []string `json:"expressionNotes"` // 表达问题（口头禅/结构乱）
 	UpdatedAt       int64    `json:"updatedAt"`

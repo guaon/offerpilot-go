@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -24,6 +25,8 @@ import (
 	"MyOfferPilot/src/logger"
 	"MyOfferPilot/src/memory"
 	"MyOfferPilot/src/realtime"
+	"MyOfferPilot/src/session"
+	tool "MyOfferPilot/src/tools"
 	"MyOfferPilot/src/user"
 
 	"github.com/cloudwego/eino/schema"
@@ -97,7 +100,7 @@ func (s *Server) Start() error {
 
 	s.mu.Lock()
 	if s.app == nil {
-		s.app = app.CreateApp(nil)
+		s.app = app.CreateApp(&app.AppOptions{DB: s.mysqlDB})
 	}
 	s.mu.Unlock()
 
@@ -111,6 +114,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/chat", s.requireAuth(s.handleChat))
 	mux.HandleFunc("/api/session", s.requireAuth(s.handleSession))
 	mux.HandleFunc("/api/session/new", s.requireAuth(s.handleSessionNew))
+	mux.HandleFunc("/api/sessions", s.requireAuth(s.handleSessions))
 	mux.HandleFunc("/api/transcribe", s.requireAuth(s.handleTranscribe))
 	mux.HandleFunc("/api/tts", s.requireAuth(s.handleTTS))
 	mux.HandleFunc("/api/config", s.requireAuth(s.handleConfig))
@@ -236,6 +240,7 @@ func (s *Server) handleChat(w http.ResponseWriter, req *http.Request) {
 	userID := userIDFromContext(req.Context())
 	appInst := app.CreateApp(&app.AppOptions{
 		Model:           chatReq.Model,
+		DB:              s.mysqlDB,
 		SessionManager:  s.app.SessionManager,
 		MemoryStore:     s.app.MemoryStore,
 		OnTextDelta:     func(text string) { send(ChatEvent{Type: "text_delta", Content: text}) },
@@ -244,6 +249,9 @@ func (s *Server) handleChat(w http.ResponseWriter, req *http.Request) {
 		OnToolResult:    func(name string, result string) { send(ChatEvent{Type: "tool_result", Name: name, Result: result}) },
 		OnDiagnosisRecord: func(sessionID, dimension string, score int, question string) {
 			s.recordDiagnosis(userID, sessionID, dimension, score, question)
+		},
+		OnInterviewQuestions: func(questions []string) {
+			s.saveInterviewQuestions(questions)
 		},
 	})
 	s.mu.Unlock()
@@ -304,6 +312,7 @@ func (s *Server) handleChat(w http.ResponseWriter, req *http.Request) {
 }
 
 // handleSessionNew 创建全新的对话会话（新会话功能入口）。
+// 若存在旧会话，先生成摘要写入 MemoryEntry（context 类型），再标记旧会话为 completed。
 func (s *Server) handleSessionNew(w http.ResponseWriter, req *http.Request) {
 	s.cors(w)
 
@@ -317,6 +326,17 @@ func (s *Server) handleSessionNew(w http.ResponseWriter, req *http.Request) {
 	}
 
 	userID := userIDFromContext(req.Context())
+
+	// 1. 若有旧会话，生成摘要并写入长期记忆
+	if c, err := req.Cookie("offerpilot_sid"); err == nil && c.Value != "" {
+		if oldSess, err := s.app.SessionManager.Get(c.Value); err == nil && oldSess != nil && len(oldSess.Messages) > 0 {
+			s.summarizeAndRemember(userID, c.Value, oldSess)
+			// 标记旧会话为 completed
+			s.app.SessionManager.Transition(c.Value, session.SessionStateCompleted)
+		}
+	}
+
+	// 2. 创建新会话
 	session := s.app.SessionManager.Create(userID)
 
 	http.SetCookie(w, &http.Cookie{
@@ -329,6 +349,134 @@ func (s *Server) handleSessionNew(w http.ResponseWriter, req *http.Request) {
 	})
 
 	writeJSON(w, http.StatusOK, map[string]string{"sessionId": session.ID})
+}
+
+// summarizeAndRemember 从旧会话消息中提取关键信息，写入长期记忆。
+func (s *Server) summarizeAndRemember(userID, sessionID string, oldSess *session.Session) {
+	if s.app == nil || s.app.MemoryStore == nil {
+		return
+	}
+	ms := s.app.MemoryStore
+
+	// 提取用户消息和诊断维度
+	var userMessages []string
+	dimensions := make(map[string]bool)
+	for _, msg := range oldSess.Messages {
+		if msg.Role == "user" && msg.Content != "" {
+			userMessages = append(userMessages, msg.Content)
+		}
+	}
+
+	// 从诊断记录中提取维度
+	if s.mysqlDB != nil {
+		rows, err := s.mysqlDB.Query(
+			`SELECT DISTINCT dimension FROM diagnoses WHERE session_id = ?`,
+			sessionID,
+		)
+		if err == nil {
+			for rows.Next() {
+				var dim string
+				if rows.Scan(&dim) == nil {
+					dimensions[dim] = true
+				}
+			}
+			rows.Close()
+		}
+	}
+
+	// 生成会话摘要
+	topics := extractTopicsFromMessages(userMessages)
+	summary := buildSessionSummary(topics, dimensions, len(oldSess.Messages))
+
+	// 写入 MemoryEntry（context 类型，跨会话保留）
+	ms.Add(memory.MemoryEntry{
+		UserID:     userID,
+		SessionID:  sessionID,
+		Type:       memory.MemoryTypeContext,
+		Content:    summary,
+		Importance: 0.8,
+	})
+}
+
+// extractTopicsFromMessages 从用户消息中提取关键主题。
+func extractTopicsFromMessages(messages []string) []string {
+	keywords := []string{
+		"Agent", "RAG", "LLM", "embedding", "向量", "ReAct", "Tool Call",
+		"Prompt", "微调", "训练", "推理", "大模型", "GPT", "Claude", "LangChain",
+		"Docker", "Kubernetes", "K8s", "微服务", "架构", "分布式", "高并发",
+		"Python", "Go", "Java", "TypeScript", "Rust",
+		"PostgreSQL", "MySQL", "Redis", "MongoDB", "Elasticsearch", "Milvus",
+		"评测", "benchmark", "延迟", "QPS", "吞吐", "性能",
+		"Context Window", "Token", "Chunk", "Rerank", "HyDE",
+		"System Prompt", "Memory", "Session", "Hook", "Permission",
+		"STAR", "简历", "面试", "JD", "offer",
+	}
+	seen := make(map[string]bool)
+	var topics []string
+	for _, msg := range messages {
+		lower := strings.ToLower(msg)
+		for _, kw := range keywords {
+			kwLower := strings.ToLower(kw)
+			if strings.Contains(lower, kwLower) && !seen[kw] {
+				seen[kw] = true
+				topics = append(topics, kw)
+			}
+		}
+	}
+	return topics
+}
+
+// buildSessionSummary 构建会话摘要文本。
+func buildSessionSummary(topics []string, dimensions map[string]bool, msgCount int) string {
+	var parts []string
+	if len(topics) > 0 {
+		parts = append(parts, "讨论主题："+strings.Join(topics, "、"))
+	}
+	if len(dimensions) > 0 {
+		var dims []string
+		for d := range dimensions {
+			dims = append(dims, d)
+		}
+		parts = append(parts, "诊断维度："+strings.Join(dims, "、"))
+	}
+	parts = append(parts, fmt.Sprintf("共 %d 轮对话", msgCount/2))
+	return strings.Join(parts, " | ")
+}
+
+// handleSessions 返回当前用户的所有会话列表。
+func (s *Server) handleSessions(w http.ResponseWriter, req *http.Request) {
+	s.cors(w)
+
+	if req.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if req.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := userIDFromContext(req.Context())
+	sessions := s.app.SessionManager.ListByUserID(userID)
+
+	type sessionItem struct {
+		ID        string `json:"id"`
+		UpdatedAt int64  `json:"updatedAt"`
+	}
+	items := make([]sessionItem, 0, len(sessions))
+	for _, sess := range sessions {
+		// 只返回有消息的会话，过滤空会话
+		if len(sess.Messages) > 0 {
+			items = append(items, sessionItem{
+				ID:        sess.ID,
+				UpdatedAt: sess.UpdatedAt,
+			})
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{"sessions": items})
 }
 
 func (s *Server) handleSession(w http.ResponseWriter, req *http.Request) {
@@ -420,6 +568,19 @@ func (s *Server) handleSession(w http.ResponseWriter, req *http.Request) {
 		})
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	case http.MethodDelete:
+		sid := req.URL.Query().Get("id")
+		if sid == "" {
+			http.Error(w, "id required", http.StatusBadRequest)
+			return
+		}
+		userID := userIDFromContext(req.Context())
+		if err := s.app.SessionManager.Delete(sid, userID); err != nil {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
 	}
 }
 
@@ -774,6 +935,17 @@ func (s *Server) recordDiagnosis(userID, sessionID, dimension string, score int,
 	s.saveKnowledgePoint(userID, dimension, score)
 }
 
+// saveInterviewQuestions 把 mock_interview 生成的题目序列存到活性画像。
+func (s *Server) saveInterviewQuestions(questions []string) {
+	if s.app == nil || s.app.MemoryStore == nil {
+		return
+	}
+	ap := s.app.MemoryStore.GetActiveProfile()
+	ap.Questions = questions
+	ap.QuestionIndex = 0 // 重置题号，准备从第 1 题开始
+	s.app.MemoryStore.UpdateActiveProfile(*ap)
+}
+
 // updateActiveProfile 更新第一层活性画像（面试状态机）。
 func (s *Server) updateActiveProfile(dimension, question string) {
 	if s.app == nil || s.app.MemoryStore == nil {
@@ -862,6 +1034,11 @@ func (s *Server) loadProfile(userID string) {
 		p.TargetPosition = pos.String
 		p.CurrentSituation = sit.String
 		ms.SetProfile(&p)
+	}
+
+	// 加载 MemoryEntry（weakness/strength/face/preference/context）到内存缓存
+	if err := ms.LoadFromMySQL(userID); err != nil {
+		logger.DefaultLogger.Warn("load memories failed", map[string]interface{}{"error": err.Error()})
 	}
 }
 
@@ -1487,8 +1664,8 @@ func (s *Server) handleMatch(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	jdKeywords := extractKeywords(body.JD)
-	resumeKeywords := extractKeywords(body.Resume)
+	jdKeywords := tool.ExtractKeywords(body.JD)
+	resumeKeywords := tool.ExtractKeywords(body.Resume)
 
 	matched := make([]string, 0)
 	for _, kw := range jdKeywords {
@@ -1523,9 +1700,9 @@ func (s *Server) handleMatch(w http.ResponseWriter, req *http.Request) {
 		score = (len(matched) * 100) / len(jdKeywords)
 	}
 
-	level := detectLevel(body.JD)
-	focus := detectFocus(body.JD)
-	suggestions := generateSuggestions(missing, body.Resume)
+	level := tool.DetectLevel(body.JD)
+	focus := tool.DetectFocus(body.JD)
+	suggestions := tool.GenerateSuggestions(missing, body.Resume)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -1537,133 +1714,6 @@ func (s *Server) handleMatch(w http.ResponseWriter, req *http.Request) {
 		"level":       level,
 		"focus":       focus,
 	})
-}
-
-func extractKeywords(text string) []string {
-	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`TypeScript|JavaScript|Python|Go|Rust|Java|C\+\+`),
-		regexp.MustCompile(`React|Vue|Angular|Next\.?js|Node\.?js|Express`),
-		regexp.MustCompile(`Docker|Kubernetes|K8s|CI\/CD|GitHub Actions`),
-		regexp.MustCompile(`PostgreSQL|MySQL|Redis|MongoDB|SQLite|Elasticsearch`),
-		regexp.MustCompile(`LLM|GPT|Claude|Agent|RAG|embedding|向量`),
-		regexp.MustCompile(`分布式|微服务|gRPC|REST|GraphQL|WebSocket|SSE`),
-		regexp.MustCompile(`TDD|单元测试|E2E|集成测试|自动化测试`),
-		regexp.MustCompile(`Webpack|Vite|ESBuild|Tailwind|shadcn`),
-		regexp.MustCompile(`AWS|GCP|Azure|阿里云|腾讯云`),
-		regexp.MustCompile(`机器学习|深度学习|NLP|CV|MLOps|训练|微调`),
-		regexp.MustCompile(`Milvus|Qdrant|Pinecone|Faiss|向量数据库`),
-		regexp.MustCompile(`Prompt|CoT|ReAct|Tool Use|Function Calling`),
-		regexp.MustCompile(`架构设计|系统设计|高可用|高并发|性能优化`),
-		regexp.MustCompile(`数据处理|ETL|数据管道|Spark|Flink`),
-	}
-
-	keywords := make(map[string]bool)
-	for _, pattern := range patterns {
-		matches := pattern.FindAllString(text, -1)
-		for _, m := range matches {
-			keywords[strings.ToLower(strings.TrimSpace(m))] = true
-		}
-	}
-
-	cnMatches := regexp.MustCompile(`[一-鿿]{2,6}(?:系统|架构|服务|引擎|平台|框架|协议|模型|算法|能力)`).FindAllString(text, -1)
-	for _, m := range cnMatches {
-		keywords[m] = true
-	}
-
-	result := make([]string, 0, len(keywords))
-	for k := range keywords {
-		result = append(result, k)
-	}
-	return result
-}
-
-func detectLevel(jd string) string {
-	if regexp.MustCompile(`[5五]年以上|资深|高级|P[67]`).MatchString(jd) {
-		return "高级工程师 (P6-P7)"
-	}
-	if regexp.MustCompile(`[3三]年以上|中级|P5`).MatchString(jd) {
-		return "中级工程师 (P5)"
-	}
-	if regexp.MustCompile(`[8八]年以上|专家|架构师|P[89]`).MatchString(jd) {
-		return "专家/架构师 (P8+)"
-	}
-	return "工程师"
-}
-
-func detectFocus(jd string) []string {
-	areas := make([]string, 0)
-	if regexp.MustCompile(`Agent|LLM|大模型|GPT|Claude`).MatchString(jd) {
-		areas = append(areas, "AI/LLM 工程")
-	}
-	if regexp.MustCompile(`架构|系统设计|分布式`).MatchString(jd) {
-		areas = append(areas, "系统架构")
-	}
-	if regexp.MustCompile(`全栈|前端|后端|Web`).MatchString(jd) {
-		areas = append(areas, "全栈开发")
-	}
-	if regexp.MustCompile(`RAG|检索|知识库|向量`).MatchString(jd) {
-		areas = append(areas, "RAG/检索")
-	}
-	if regexp.MustCompile(`数据|ETL|管道|分析`).MatchString(jd) {
-		areas = append(areas, "数据工程")
-	}
-	if len(areas) == 0 {
-		areas = append(areas, "软件工程")
-	}
-	return areas
-}
-
-func generateSuggestions(missing []string, resume string) []string {
-	suggestions := make([]string, 0)
-
-	if len(missing) > 5 {
-		suggestions = append(suggestions, "JD 要求的技术栈覆盖不足，建议在项目经历中补充相关技术的使用经验")
-	}
-
-	hasDocker := false
-	hasDistributed := false
-	hasAgent := false
-	hasTest := false
-	for _, kw := range missing {
-		if strings.Contains(kw, "docker") || strings.Contains(kw, "k8s") || strings.Contains(kw, "kubernetes") || strings.Contains(kw, "容器") {
-			hasDocker = true
-		}
-		if strings.Contains(kw, "分布式") || strings.Contains(kw, "高并发") || strings.Contains(kw, "高可用") {
-			hasDistributed = true
-		}
-		if strings.Contains(kw, "agent") || strings.Contains(kw, "llm") || strings.Contains(kw, "大模型") || strings.Contains(kw, "rag") {
-			hasAgent = true
-		}
-		if strings.Contains(kw, "测试") || strings.Contains(kw, "tdd") || strings.Contains(kw, "e2e") {
-			hasTest = true
-		}
-	}
-
-	if hasDocker {
-		suggestions = append(suggestions, "补充容器化/部署相关经验，即使只是 Docker 单机部署也值得提及")
-	}
-	if hasDistributed {
-		suggestions = append(suggestions, "在项目中突出系统规模（QPS、数据量、节点数），体现分布式思维")
-	}
-	if hasAgent {
-		suggestions = append(suggestions, "突出 AI/LLM 相关实践，包括 Prompt 工程、RAG 搭建、Agent 开发")
-	}
-	if hasTest {
-		suggestions = append(suggestions, "补充测试实践：测试覆盖率、TDD 经验、CI 自动化")
-	}
-
-	if !regexp.MustCompile(`\d+%|\d+ms|\d+QPS|\d+万`).MatchString(resume) {
-		suggestions = append(suggestions, "简历中缺少量化数据，建议每个项目至少有 1-2 个数字指标")
-	}
-
-	if len(suggestions) == 0 {
-		suggestions = append(suggestions, "匹配度良好，建议进一步强化最核心的 2-3 个技术点的深度描述")
-	}
-
-	if len(suggestions) > 5 {
-		suggestions = suggestions[:5]
-	}
-	return suggestions
 }
 
 func (s *Server) handleResume(w http.ResponseWriter, req *http.Request) {
@@ -1701,110 +1751,15 @@ func (s *Server) handleResume(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	sections := splitSections(body.Content)
+	sections := tool.SplitSections(body.Content)
 	diagnosis := make([]map[string]interface{}, 0)
 	for _, section := range sections {
-		diagnosis = append(diagnosis, analyzeSection(section))
+		diagnosis = append(diagnosis, tool.AnalyzeSection(section))
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{"diagnosis": diagnosis})
-}
-
-func splitSections(content string) []map[string]string {
-	lines := strings.Split(content, "\n")
-	sections := make([]map[string]string, 0)
-	var current map[string]string
-
-	for _, line := range lines {
-		match := regexp.MustCompile(`^#{1,3}\s+(.+)`).FindStringSubmatch(line)
-		if match != nil {
-			if current != nil {
-				sections = append(sections, current)
-			}
-			current = map[string]string{"title": match[1], "text": ""}
-		} else if current != nil {
-			if current["text"] == "" {
-				current["text"] = line
-			} else {
-				current["text"] += "\n" + line
-			}
-		} else if strings.TrimSpace(line) != "" {
-			current = map[string]string{"title": "项目经历", "text": line}
-		}
-	}
-
-	if current != nil {
-		sections = append(sections, current)
-	}
-
-	if len(sections) == 0 {
-		paragraphs := regexp.MustCompile(`\n{2,}`).Split(content, -1)
-		for i, p := range paragraphs {
-			if strings.TrimSpace(p) != "" {
-				sections = append(sections, map[string]string{"title": fmt.Sprintf("段落 %d", i+1), "text": strings.TrimSpace(p)})
-			}
-		}
-	}
-
-	return sections
-}
-
-func analyzeSection(section map[string]string) map[string]interface{} {
-	title := section["title"]
-	text := section["text"]
-	issues := make([]string, 0)
-	suggestions := make([]string, 0)
-	score := 8
-
-	if len(text) < 30 {
-		issues = append(issues, "内容过少")
-		suggestions = append(suggestions, "补充技术栈、成果和具体数据")
-		score -= 2
-	}
-
-	if !regexp.MustCompile(`\d+`).MatchString(text) {
-		issues = append(issues, "缺少量化数据")
-		suggestions = append(suggestions, "加入性能指标：延迟、QPS、成功率、覆盖人数等")
-		score -= 1
-	}
-
-	if !regexp.MustCompile(`[结果成果效果提升降低优化]`).MatchString(text) && len(text) > 50 {
-		issues = append(issues, "未体现成果")
-		suggestions = append(suggestions, "用 STAR 结构结尾加上 Result（成果）")
-		score -= 1
-	}
-
-	if !regexp.MustCompile(`[选择|设计|架构|方案]`).MatchString(text) && len(text) > 80 {
-		issues = append(issues, "未体现技术决策")
-		suggestions = append(suggestions, "描述为什么选择该技术方案，体现判断力")
-		score -= 1
-	}
-
-	if len(text) > 60 && !strings.Contains(text, "负责") && !strings.Contains(text, "主导") && !strings.Contains(text, "我") {
-		issues = append(issues, "未突出个人贡献")
-		suggestions = append(suggestions, "明确个人角色：\"我负责...\"、\"我主导了...\"")
-		score -= 1
-	}
-
-	buzzwords := len(regexp.MustCompile(`精通|熟悉|了解|掌握`).FindAllString(text, -1))
-	if buzzwords >= 3 {
-		issues = append(issues, "技能描述太泛")
-		suggestions = append(suggestions, "用项目经验佐证技能水平，而非堆砌\"精通/熟悉\"")
-		score -= 1
-	}
-
-	if len(issues) == 0 {
-		suggestions = append(suggestions, "继续保持，可适当补充更多量化数据")
-	}
-
-	return map[string]interface{}{
-		"section":     title,
-		"score":       max(3, min(10, score)),
-		"issues":      issues,
-		"suggestions": suggestions,
-	}
 }
 
 func (s *Server) handleParsePDF(w http.ResponseWriter, req *http.Request) {
@@ -2194,7 +2149,7 @@ func (s *Server) handleStaticOrSPA(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	filePath := filepath.Join("web", req.URL.Path)
+	filePath := path.Join("web", req.URL.Path)
 	data, err := webFiles.ReadFile(filePath)
 	if err != nil {
 		data, err = webFiles.ReadFile("web/index.html")

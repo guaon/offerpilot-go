@@ -14,6 +14,7 @@ import (
 	subagent "MyOfferPilot/src/sub-agent"
 	tool "MyOfferPilot/src/tools"
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 )
@@ -47,6 +48,12 @@ const SystemPrompt = `你是 OfferPilot，一个全链路求职辅导 Agent，�
 14. 每题即时反馈 + 改进建议
 15. 全场总结报告（评分 + 缺陷分布 + 高频问题）
 
+【求职辅导方法论】
+16. 岗位评估：按五维加权评分（技术栈30%/经验25%/行为15%/职业规划30%+地点PassFail）评价岗位匹配度
+17. 写作指导：遵循专业写作风格指南（禁止陈词滥调、前向视角、面试回溯测试、具体支撑）
+18. 行为画像：分析用户性格特质与岗位文化的匹配度（建设者/优化者/协作者/专精者）
+19. 面试准备：提供常见棘手问题模板、反问面试官的问题库、模拟面试角色扮演流程
+
 录音转写诊断规则：
 - 如果用户输入来自录音转写，先从文本中拆分"面试官问题"和"候选人回答"
 - 评分必须围绕识别出的面试官问题，不要因为回答里出现 Agent、RAG、ReAct 等关键词就替换题目
@@ -59,11 +66,25 @@ const SystemPrompt = `你是 OfferPilot，一个全链路求职辅导 Agent，�
 - 如果系统确实没有注入任何记忆（新用户第一次对话），可以诚实说"这是我们第一次对话，我还没有你的历史记录"
 
 工作方式：
-- 用户贴入 JD → **必须调用 analyze_jd 工具**，不要自己分析
-- 用户说"模拟面试"/"生成面试题" → **必须调用 mock_interview 工具**
+- 当需要展示**表格、匹配矩阵、评分圆环**等结构化内容时，必须使用 ` + "```rich" + ` JSON 格式输出（不要用 Markdown 表格），格式如下：
+  ` + "```rich" + `
+  {"type":"match_matrix","title":"匹配矩阵","columns":["JD要求","匹配度","我的经历","策略"],"rows":[["...","🟢","...","..."]]}
+  ` + "```" + `
+  支持的类型：match_matrix（匹配矩阵，带🟢🟡🔴颜色）、table（普通表格）、score（评分圆环，需传score/total/label）、cards（卡片列表，需传items数组每项含title/body）
+- 用户贴入 JD 要求分析（不涉及简历对比） → **必须调用 analyze_jd 工具**，不要自己分析
+- 用户同时提供 JD 和简历要求对比 → **必须调用 match_jd_resume 工具**。工具返回匹配矩阵后，先输出矩阵 + 2-3 句总结，然后询问用户下一步需求（准备面试问题/写自我介绍/短板补救）。用户做出选择后，用你的 LLM 能力直接生成对应内容，不需要再调工具
+- 用户贴入简历要求诊断 → **必须调用 diagnose_resume 工具**
+- 用户首次说"模拟面试"/"生成面试题" → **必须调用 mock_interview 工具，一次性生成完整题目序列（count 设为 5-8 题）**
+- 用户说"下一题"/"继续"/"开始面试" → **不要调用 mock_interview**，直接从之前生成的题目序列中按顺序取出下一题（题目已在首次生成，重复调用会打乱面试）
 - 用户想面试"agent 方向" → mock_interview 传 dimension="agent"（聚合架构+工程+多Agent题目，不要用 multi-agent）
 - 用户说"搜索"/"查找"面试题 → **必须调用 search_knowledge 工具**
 - 用户输入面试回答 → 先调用 search_knowledge 搜索该题目的高手答案，诊断后必须调用 record_diagnosis 记录评分
+- 面试过程中保持题目顺序连贯，不要跳过或更换已生成的题目
+- 出题和诊断要简洁直接，不要长篇思考或反复纠结题号；"下一题"时直接根据注入的题目序列出下一题
+- 用户要求深入评估岗位匹配度 → 先调用 search_knowledge 搜索"岗位评估框架"（dimension="coaching"），获取五维评分方法论，然后按方法论输出结构化评估
+- 用户要求优化简历/求职信的文字表达 → 先调用 search_knowledge 搜索"写作风格指南"（dimension="coaching"），获取写作规则，然后逐条对照诊断
+- 用户问"这个岗位适合我吗"或"我和这个团队合得来吗" → 先调用 search_knowledge 搜索"行为画像"（dimension="coaching"），分析用户性格与岗位的匹配度
+- 用户要求面试技巧指导（不是模拟面试） → 先调用 search_knowledge 搜索"面试准备"（dimension="coaching"），获取常见棘手问题模板和反问问题库
 
 **强制规则：**
 1. 你没有实时更新的知识，必须调用工具来获取信息
@@ -73,6 +94,7 @@ const SystemPrompt = `你是 OfferPilot，一个全链路求职辅导 Agent，�
 5. 禁止直接凭记忆回答，应该先调用工具
 6. 诊断用户回答前，必须先调用 search_knowledge 获取该题目的高手答作为对照
 7. 完成诊断后，必须调用 record_diagnosis 工具记录评分（维度+分数+题目），这会自动更新能力雷达图
+8. 进行岗位评估、简历优化、行为匹配、面试准备指导时，必须先调用 search_knowledge（dimension="coaching"）获取对应方法论，不要凭记忆输出
 
 诊断输出模板（诊断用户回答时，回复必须严格遵循以下 Markdown 结构，区块标题不能省略或改动）：
 
@@ -95,6 +117,7 @@ const SystemPrompt = `你是 OfferPilot，一个全链路求职辅导 Agent，�
 
 type AppOptions struct {
 	Model           string
+	DB              *sql.DB
 	SessionManager  *session.SessionManager
 	MemoryStore     *memory.MemoryStore
 	OnTextDelta     func(text string)
@@ -103,6 +126,8 @@ type AppOptions struct {
 	OnToolResult    func(name string, input string)
 	// OnDiagnosisRecord is passed through to the record_diagnosis tool.
 	OnDiagnosisRecord func(sessionID string, dimension string, score int, question string)
+	// OnInterviewQuestions is passed through to the mock_interview tool.
+	OnInterviewQuestions func(questions []string)
 }
 
 type App struct {
@@ -135,6 +160,8 @@ func CreateApp(opts *AppOptions) *App {
 	toolRegistry.Registry(tool.AnalyzeJD())
 	toolRegistry.Registry(tool.MockInterview())
 	toolRegistry.Registry(tool.RecordDiagnosis())
+	toolRegistry.Registry(tool.DiagnoseResume())
+	toolRegistry.Registry(tool.MatchJDResume())
 
 	logger.DefaultLogger.Info("Tools registered", map[string]interface{}{
 		"toolCount": len(toolRegistry.ListSchemas()),
@@ -159,21 +186,32 @@ func CreateApp(opts *AppOptions) *App {
 		ToolName:           "analyze_jd",
 		RateLimitPerMinute: 5,
 	})
+	permissionGate.RegisterRule(permission.PermissionRule{
+		ToolName:           "diagnose_resume",
+		RateLimitPerMinute: 5,
+	})
+	permissionGate.RegisterRule(permission.PermissionRule{
+		ToolName:           "match_jd_resume",
+		RateLimitPerMinute: 5,
+	})
 
 	contextManager := appcontext.NewContextManager(nil)
+
+	// 统一使用 MySQL（若不可用则降级为纯内存模式）
+	var db *sql.DB
+	if opts != nil && opts.DB != nil {
+		db = opts.DB
+	}
 
 	var sessionManager *session.SessionManager
 	var err error
 	if opts != nil && opts.SessionManager != nil {
 		sessionManager = opts.SessionManager
 	} else {
-		dbPath := os.Getenv("SESSION_DB_PATH")
-		sessionManager, err = session.NewSessionManager(dbPath)
+		sessionManager, err = session.NewSessionManager(db)
 		if err != nil {
 			logger.DefaultLogger.Warn("Failed to create session manager", map[string]interface{}{"error": err.Error()})
 			sessionManager = &session.SessionManager{}
-		} else if dbPath != "" {
-			logger.DefaultLogger.Info("Session manager loaded", map[string]interface{}{"dbPath": dbPath})
 		}
 	}
 	sessionManager.EnsureLoaded()
@@ -183,7 +221,7 @@ func CreateApp(opts *AppOptions) *App {
 		memStore = opts.MemoryStore
 	} else {
 		var err error
-		memStore, err = memory.NewMemoryStore("")
+		memStore, err = memory.NewMemoryStore(db)
 		if err != nil {
 			logger.DefaultLogger.Warn("failed to create memory store", map[string]interface{}{"error": err.Error()})
 			memStore = &memory.MemoryStore{}
@@ -221,6 +259,7 @@ func CreateApp(opts *AppOptions) *App {
 	var onToolCall func(name string, input map[string]interface{})
 	var onToolResult func(name string, result string)
 	var onDiagnosisRecord func(sessionID string, dimension string, score int, question string)
+	var onInterviewQuestions func(questions []string)
 
 	if opts != nil {
 		onTextDelta = opts.OnTextDelta
@@ -228,6 +267,7 @@ func CreateApp(opts *AppOptions) *App {
 		onToolCall = opts.OnToolCall
 		onToolResult = opts.OnToolResult
 		onDiagnosisRecord = opts.OnDiagnosisRecord
+		onInterviewQuestions = opts.OnInterviewQuestions
 	}
 
 	agentLoop := agent.NewAgentLoop(agent.AgentConfig{
@@ -246,6 +286,7 @@ func CreateApp(opts *AppOptions) *App {
 		OnToolCall:        onToolCall,
 		OnToolResult:      onToolResult,
 		OnDiagnosisRecord: onDiagnosisRecord,
+		OnInterviewQuestions: onInterviewQuestions,
 	})
 
 	return &App{

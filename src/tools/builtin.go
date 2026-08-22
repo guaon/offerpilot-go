@@ -182,10 +182,38 @@ func AnalyzeJD() *ToolDefinition {
 				prepFocus = append(prepFocus, "技术深度+项目经验复盘")
 			}
 
+			// 五维评估框架（来自岗位评估方法论）
+			evaluationFramework := map[string]interface{}{
+				"title": "请按以下五维框架输出结构化评估，每维打分并给出理由",
+				"dimensions": []map[string]interface{}{
+					{"name": "技术栈匹配", "weight": "30%", "guide": "核心要求是否匹配用户的主要技能？Agent方向关注：Agent架构、Tool开发、LLM调用层、Prompt Engineering、RAG"},
+					{"name": "经验匹配", "weight": "25%", "guide": "工作内容的实质是否匹配？不要只看岗位名称——一个'数据顾问'和一个'数据科学家'可能做同样的事"},
+					{"name": "行为/文化匹配", "weight": "15%", "guide": "JD中是否有红旗信号：部门混乱、维护为主、领导层口碑差、加班文化严重？"},
+					{"name": "地点与后勤", "weight": "Pass/Fail", "guide": "通勤可达/远程→PASS；需要搬迁→FAIL（硬否决）；频繁国际出差→FLAG"},
+					{"name": "职业规划匹配", "weight": "30%", "guide": "这个岗位是否推进用户的职业目标？工作内容是否激发而非消耗用户？"},
+				},
+				"thresholds": []map[string]string{
+					{"label": "强匹配", "range": "75+", "action": "绝对投递，全力定制"},
+					{"label": "良好匹配", "range": "60-74", "action": "投递，在求职信中解决缺口"},
+					{"label": "中等匹配", "range": "45-59", "action": "慎重考虑"},
+					{"label": "弱匹配", "range": "30-44", "action": "除非有战略原因，否则跳过"},
+					{"label": "不匹配", "range": "<30", "action": "跳过"},
+				},
+				"outputFormat": "| 维度 | 分数 | 说明 |\n|------|------|------|\n| 技术栈 | XX/100 | ... |\n| ... | 综合评分：XX/100 | 结论：[强匹配/良好/中等/弱/不匹配] |",
+			}
+
+			// 资格门检查提示
+			eligibilityCheck := map[string]string{
+				"visa":    "检查JD中是否明确要求公民/永居/安全审查。如果要求了用户没有的→硬停。如果未提及→标记未验证。",
+				"language": "检查JD对岗位本身的语言要求（不是广告用什么语言写的）。要求用户未声明的语言→硬停。要求级别可能不够→FLAG。",
+			}
+
 			data, _ := json.Marshal(map[string]interface{}{
-				"techStack":     map[string]interface{}{"required": techRequired, "niceToHave": techNiceToHave},
-				"softSkills":    softSkills,
-				"interviewPrep": prepFocus,
+				"techStack":           map[string]interface{}{"required": techRequired, "niceToHave": techNiceToHave},
+				"softSkills":          softSkills,
+				"interviewPrep":       prepFocus,
+				"evaluationFramework": evaluationFramework,
+				"eligibilityCheck":    eligibilityCheck,
 			})
 			return ToolResult{Success: true, Output: string(data)}
 		},
@@ -253,6 +281,13 @@ func MockInterview() *ToolDefinition {
 							dim = dimension
 						}
 						results = append(results, qResult{i + 1, q, dim, difficulty})
+					}
+					if ctx.OnInterviewQuestions != nil {
+						qs := make([]string, len(results))
+						for i, r := range results {
+							qs[i] = r.Question
+						}
+						ctx.OnInterviewQuestions(qs)
 					}
 					data, _ := json.Marshal(map[string]interface{}{
 						"dimension":      dimension,
@@ -342,6 +377,14 @@ func MockInterview() *ToolDefinition {
 			results := make([]qResult, len(pool))
 			for i, q := range pool {
 				results[i] = qResult{i + 1, q.Q, q.Dim, q.Diff}
+			}
+
+			if ctx.OnInterviewQuestions != nil {
+				qs := make([]string, len(results))
+				for i, r := range results {
+					qs[i] = r.Question
+				}
+				ctx.OnInterviewQuestions(qs)
 			}
 
 			data, _ := json.Marshal(map[string]interface{}{

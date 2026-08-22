@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,25 +19,8 @@ type SessionManager struct {
 	db          *sql.DB
 }
 
-func NewSessionManager(dbPath string) (*SessionManager, error) {
-	var db *sql.DB
-	var err error
-
-	if dbPath != "" {
-		db, err = sql.Open("sqlite", dbPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open database: %w", err)
-		}
-
-		if err := db.Ping(); err != nil {
-			return nil, fmt.Errorf("failed to ping database: %w", err)
-		}
-
-		if err := createSessionTables(db); err != nil {
-			return nil, fmt.Errorf("failed to create tables: %w", err)
-		}
-	}
-
+// NewSessionManager 创建 SessionManager。db 为 MySQL 连接；传 nil 则仅内存模式。
+func NewSessionManager(db *sql.DB) (*SessionManager, error) {
 	sm := &SessionManager{
 		sessions:    make(map[string]*Session),
 		checkpoints: make(map[string][]*CheckPoints),
@@ -63,40 +47,6 @@ func (sm *SessionManager) EnsureLoaded() {
 	}
 }
 
-func createSessionTables(db *sql.DB) error {
-	queries := []string{
-		`CREATE TABLE IF NOT EXISTS sessions(
-		    id TEXT NOT NULL,
-			state TEXT NOT NULL,
-			user_id TEXT,
-			metadata TEXT NOT NULL,
-			created_at INTEGER NOT NULL,
-			updated_at INTEGER NOT NULL
-		);`,
-		`CREATE TABLE IF NOT EXISTS messages(
-		    id INTEGER PRIMARY KEY AUTOINCREMENT,
-			session_id TEXT NOT NULL,
-			role TEXT NOT NULL,
-			content TEXT,
-			tool_call_id TEXT,
-			tool_calls TEXT,
-			created_at INTEGER NOT NULL,
-			FOREIGN KEY (session_id) REFERENCES sessions(id)
-		);`,
-
-		`CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);`,
-	}
-
-	for _, query := range queries {
-		if _, err := db.Exec(query); err != nil {
-			return fmt.Errorf("failed to execute query: %w", err)
-
-		}
-	}
-
-	return nil
-}
-
 func (sm *SessionManager) Create(userID string) *Session {
 	now := time.Now().UnixMilli()
 
@@ -118,9 +68,9 @@ func (sm *SessionManager) Create(userID string) *Session {
 	if sm.db != nil {
 		metadataJSON, _ := json.Marshal(s.Metadata)
 		sm.db.Exec(`
-		    INSERT INTO sessions(id,state,user_id,metadata,created_at,updated_at)
-			VALUES(?,?,?,?,?,?)`,
-			s.ID, s.State, userID, string(metadataJSON), now/1000, now/1000)
+			INSERT INTO chat_sessions(id, user_id, state, metadata, created_at, updated_at)
+			VALUES(?, ?, ?, ?, ?, ?)`,
+			s.ID, userID, string(s.State), string(metadataJSON), now, now)
 	}
 
 	return s
@@ -137,19 +87,19 @@ func (sm *SessionManager) ClaimSession(sessionID, userID string) error {
 
 	if sm.db != nil {
 		metadataJSON, _ := json.Marshal(s.Metadata)
-		sm.db.Exec(`UPDATE sessions SET user_id=?, metadata=?, updated_at=? WHERE id=?`,
-			userID, string(metadataJSON), s.UpdatedAt/1000, sessionID)
+		sm.db.Exec(`UPDATE chat_sessions SET user_id = ?, metadata = ?, updated_at = ? WHERE id = ?`,
+			userID, string(metadataJSON), s.UpdatedAt, sessionID)
 	}
 	return nil
 }
 
-// 将指定会话从一个状态转换到另一个状态
+// Transition 将指定会话从一个状态转换到另一个状态。
 func (sm *SessionManager) Transition(id string, newState SessionState) error {
 	s := sm.sessions[id]
 	if s == nil {
 		return fmt.Errorf("session %s not found", id)
 	}
-	valid := sm.validTransitions(s.State) //根据当前状态获取可转移的状态
+	valid := sm.validTransitions(s.State)
 	found := false
 	for _, v := range valid {
 		if v == newState {
@@ -159,7 +109,7 @@ func (sm *SessionManager) Transition(id string, newState SessionState) error {
 	}
 
 	if !found {
-		return fmt.Errorf("invalid transitions:%s→%s", s.State, newState)
+		return fmt.Errorf("invalid transition: %s → %s", s.State, newState)
 	}
 
 	s.State = newState
@@ -167,8 +117,8 @@ func (sm *SessionManager) Transition(id string, newState SessionState) error {
 
 	if sm.db != nil {
 		sm.db.Exec(
-			`UPDATE sessions SET state = ?,updated_at=?WHERE id=?`,
-			newState, s.UpdatedAt/1000, id)
+			`UPDATE chat_sessions SET state = ?, updated_at = ? WHERE id = ?`,
+			string(newState), s.UpdatedAt, id)
 	}
 
 	return nil
@@ -198,7 +148,7 @@ func (sm *SessionManager) GetMessages(id string) ([]*schema.Message, error) {
 func (sm *SessionManager) AddMessage(id string, message *schema.Message) error {
 	s := sm.sessions[id]
 	if s == nil {
-		return fmt.Errorf("session %s  not found", id)
+		return fmt.Errorf("session %s not found", id)
 	}
 
 	s.Messages = append(s.Messages, message)
@@ -216,20 +166,17 @@ func (sm *SessionManager) AddMessage(id string, message *schema.Message) error {
 		}
 
 		sm.db.Exec(`
-		    INSERT INTO messages (session_id,role,content,tool_call_id,tool_calls,created_at)
-			VALUES (?,?,?,?,?,?)
-		`, id, message.Role, message.Content, message.ToolCallID, toolCallsJSON, time.Now().UnixMilli()/1000)
+			INSERT INTO messages (session_id, role, content, tool_call_id, tool_calls, created_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, id, string(message.Role), strings.ToValidUTF8(message.Content, "\ufffd"), message.ToolCallID, toolCallsJSON, time.Now().UnixMilli())
 
 		metadataJSON, _ := json.Marshal(s.Metadata)
-
 		sm.db.Exec(`
-			UPDATE sessions SET metadata=?,updated_at=? WHERE id=?
-		`, metadataJSON, s.UpdatedAt/1000, id)
-
+			UPDATE chat_sessions SET metadata = ?, updated_at = ? WHERE id = ?
+		`, string(metadataJSON), s.UpdatedAt, id)
 	}
 
 	return nil
-
 }
 
 func (sm *SessionManager) validTransitions(current SessionState) []SessionState {
@@ -261,15 +208,14 @@ func (sm *SessionManager) ReplaceMessages(id string, messages []*schema.Message)
 	if sm.db != nil {
 		tx, err := sm.db.Begin()
 		if err != nil {
-			return fmt.Errorf("failed to begin transaction:%w", err)
-
+			return fmt.Errorf("failed to begin transaction: %w", err)
 		}
 		_, err = tx.Exec("DELETE FROM messages WHERE session_id = ?", id)
 		if err != nil {
 			tx.Rollback()
-			return fmt.Errorf("failed to delete messages:%w", err)
+			return fmt.Errorf("failed to delete messages: %w", err)
 		}
-		now := time.Now().UnixMilli() / 1000
+		now := time.Now().UnixMilli()
 		for _, msg := range messages {
 			var toolCallsJSON string
 			if len(msg.ToolCalls) > 0 {
@@ -278,25 +224,23 @@ func (sm *SessionManager) ReplaceMessages(id string, messages []*schema.Message)
 			}
 
 			_, err = tx.Exec(`
-			  INSERT INTO messages (session_id,role,content,tool_call_id,tool_calls,created_at)
-			  VALUES(?,?,?,?,?,?)
-			`, id, msg.Role, msg.Content, msg.ToolCallID, toolCallsJSON, now)
+				INSERT INTO messages (session_id, role, content, tool_call_id, tool_calls, created_at)
+				VALUES(?, ?, ?, ?, ?, ?)
+			`, id, string(msg.Role), strings.ToValidUTF8(msg.Content, "\ufffd"), msg.ToolCallID, toolCallsJSON, now)
 			if err != nil {
 				tx.Rollback()
-				return fmt.Errorf("failed to insert message:%w", err)
+				return fmt.Errorf("failed to insert message: %w", err)
 			}
 		}
 
-		_, err = tx.Exec("UPDATE sessions SET updated_at=? WHERE id=?", s.UpdatedAt/1000, id)
+		_, err = tx.Exec("UPDATE chat_sessions SET updated_at = ? WHERE id = ?", s.UpdatedAt, id)
 		if err != nil {
 			tx.Rollback()
-			return fmt.Errorf("failed to update session:%w", err)
-
+			return fmt.Errorf("failed to update session: %w", err)
 		}
 		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("failed to commit transaction:%w", err)
+			return fmt.Errorf("failed to commit transaction: %w", err)
 		}
-
 	}
 
 	return nil
@@ -324,7 +268,7 @@ func (sm *SessionManager) Checkpoint(id string) (*CheckPoints, error) {
 	return cp, nil
 }
 
-// 回到检查点时的状态
+// ReWind 回到检查点时的状态。
 func (sm *SessionManager) ReWind(sessionID string, checkpointID string) error {
 	s := sm.sessions[sessionID]
 	if s == nil {
@@ -357,9 +301,54 @@ func (sm *SessionManager) ListActive() []*Session {
 		if s.State == SessionStateActive || s.State == SessionStatePaused {
 			result = append(result, s)
 		}
-
 	}
 	return result
+}
+
+// ListByUserID 返回指定用户的所有会话（按更新时间倒序）。
+func (sm *SessionManager) ListByUserID(userID string) []*Session {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	var result []*Session
+	for _, s := range sm.sessions {
+		if s.Metadata.UserID == userID {
+			result = append(result, s)
+		}
+	}
+
+	// 按更新时间倒序
+	for i := 0; i < len(result); i++ {
+		for j := i + 1; j < len(result); j++ {
+			if result[j].UpdatedAt > result[i].UpdatedAt {
+				result[i], result[j] = result[j], result[i]
+			}
+		}
+	}
+	return result
+}
+
+// Delete 删除指定会话，需校验 userID 归属。
+func (sm *SessionManager) Delete(sessionID, userID string) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	s := sm.sessions[sessionID]
+	if s == nil {
+		return fmt.Errorf("session not found")
+	}
+	if s.Metadata.UserID != "" && s.Metadata.UserID != userID {
+		return fmt.Errorf("permission denied")
+	}
+
+	delete(sm.sessions, sessionID)
+	delete(sm.checkpoints, sessionID)
+
+	if sm.db != nil {
+		sm.db.Exec("DELETE FROM messages WHERE session_id = ?", sessionID)
+		sm.db.Exec("DELETE FROM chat_sessions WHERE id = ?", sessionID)
+	}
+	return nil
 }
 
 func (sm *SessionManager) loadFromDB() error {
@@ -367,9 +356,9 @@ func (sm *SessionManager) loadFromDB() error {
 		return nil
 	}
 
-	rows, err := sm.db.Query("SELECT id,state,user_id,metadata,created_at,updated_at FROM sessions ORDER BY created_at DESC")
+	rows, err := sm.db.Query("SELECT id, state, user_id, metadata, created_at, updated_at FROM chat_sessions ORDER BY created_at DESC")
 	if err != nil {
-		return fmt.Errorf("query sessions failed:%w", err)
+		return fmt.Errorf("query sessions failed: %w", err)
 	}
 	defer rows.Close()
 
@@ -377,19 +366,18 @@ func (sm *SessionManager) loadFromDB() error {
 		var id, state, userID, metadataJSON string
 		var createdAt, updatedAt int64
 		if err := rows.Scan(&id, &state, &userID, &metadataJSON, &createdAt, &updatedAt); err != nil {
-			return fmt.Errorf("scan session failed:%w", err)
+			return fmt.Errorf("scan session failed: %w", err)
 		}
 
 		var metadata SessionMetadata
 		if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
-
-			return fmt.Errorf("failed to unmarshal metadata:%w", err)
+			return fmt.Errorf("failed to unmarshal metadata: %w", err)
 		}
 		s := &Session{
 			ID:        id,
 			State:     SessionState(state),
-			CreatedAt: createdAt * 1000,
-			UpdatedAt: updatedAt * 1000,
+			CreatedAt: createdAt,
+			UpdatedAt: updatedAt,
 			Messages:  make([]*schema.Message, 0),
 			Metadata:  metadata,
 		}
@@ -397,16 +385,15 @@ func (sm *SessionManager) loadFromDB() error {
 		if userID != "" {
 			s.Metadata.UserID = userID
 		}
-		msgRows, err := sm.db.Query("SELECT role,content,tool_call_id,tool_calls FROM messages WHERE session_id=? ORDER BY id", id)
+		msgRows, err := sm.db.Query("SELECT role, content, tool_call_id, tool_calls FROM messages WHERE session_id = ? ORDER BY id", id)
 		if err != nil {
-			return fmt.Errorf("query messages failed:%w", err)
+			return fmt.Errorf("query messages failed: %w", err)
 		}
-		defer msgRows.Close()
 		for msgRows.Next() {
 			var role, content, toolCallID, toolCallsJSON string
 			if err := msgRows.Scan(&role, &content, &toolCallID, &toolCallsJSON); err != nil {
 				msgRows.Close()
-				return fmt.Errorf("scan message failed:%w", err)
+				return fmt.Errorf("scan message failed: %w", err)
 			}
 
 			msg := &schema.Message{
@@ -420,16 +407,13 @@ func (sm *SessionManager) loadFromDB() error {
 				if err := json.Unmarshal([]byte(toolCallsJSON), &toolCalls); err == nil {
 					msg.ToolCalls = toolCalls
 				}
-
 			}
 
 			s.Messages = append(s.Messages, msg)
-
 		}
 		msgRows.Close()
 
 		sm.sessions[id] = s
-
 	}
 	return rows.Err()
 }
@@ -440,7 +424,7 @@ func (sm *SessionManager) loadSessionFromDB(id string) error {
 	}
 
 	row := sm.db.QueryRow(
-		"SELECT id,state,user_id,metadata,created_at,updated_at FROM sessions WHERE id=?",
+		"SELECT id, state, user_id, metadata, created_at, updated_at FROM chat_sessions WHERE id = ?",
 		id,
 	)
 
@@ -458,8 +442,8 @@ func (sm *SessionManager) loadSessionFromDB(id string) error {
 	s := &Session{
 		ID:        sid,
 		State:     SessionState(state),
-		CreatedAt: createdAt * 1000,
-		UpdatedAt: updatedAt * 1000,
+		CreatedAt: createdAt,
+		UpdatedAt: updatedAt,
 		Messages:  make([]*schema.Message, 0),
 		Metadata:  metadata,
 	}
@@ -469,7 +453,7 @@ func (sm *SessionManager) loadSessionFromDB(id string) error {
 	}
 
 	msgRows, err := sm.db.Query(
-		"SELECT role,content,tool_call_id,tool_calls FROM messages WHERE session_id=? ORDER BY id",
+		"SELECT role, content, tool_call_id, tool_calls FROM messages WHERE session_id = ? ORDER BY id",
 		id,
 	)
 	if err != nil {

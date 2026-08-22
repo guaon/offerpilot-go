@@ -24,6 +24,8 @@ type ToolContext struct {
 	AgentConfig interface{}
 	// OnDiagnosis is called by the record_diagnosis tool to persist scores.
 	OnDiagnosis func(sessionID string, dimension string, score int, question string)
+	// OnInterviewQuestions is called by mock_interview to persist the question sequence.
+	OnInterviewQuestions func(questions []string)
 }
 
 type toolContextKey struct{}
@@ -70,7 +72,7 @@ func (t *EinoToolAdapter) InvokableRun(ctx context.Context, argumentsInJSON stri
 
 	result := t.def.Execute(input, tc)
 	if !result.Success || result.IsError {
-		return result.Output, fmt.Errorf(result.Output)
+		return result.Output, fmt.Errorf("%s", result.Output)
 	}
 	return result.Output, nil
 }

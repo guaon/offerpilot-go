@@ -132,8 +132,12 @@ func (p *OpenAIProvider) Stream(params queryengine.StreamParams) <-chan queryeng
 						events <- &queryengine.ToolUseEndEvent{}
 						currentToolId = ""
 					}
+					usage := queryengine.TokenUsage{}
+					if response.Usage != nil {
+						usage = queryengine.TokenUsage{InputTokens: response.Usage.PromptTokens, OutputTokens: response.Usage.CompletionTokens}
+					}
 					events <- &queryengine.MessageEndEvent{
-						Usage:      queryengine.TokenUsage{InputTokens: response.Usage.PromptTokens, OutputTokens: response.Usage.CompletionTokens},
+						Usage:      usage,
 						StopReason: p.mapStopReason(string(choice.FinishReason)),
 					}
 				}

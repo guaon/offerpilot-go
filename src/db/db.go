@@ -20,6 +20,12 @@ func Open() (*sql.DB, error) {
 		return nil, fmt.Errorf("open mysql: %w", err)
 	}
 
+	// 强制 utf8mb4 连接，防止 4 字节字符（emoji 等）写入报错
+	if _, err := conn.Exec("SET NAMES utf8mb4"); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("set names utf8mb4: %w", err)
+	}
+
 	if err := conn.Ping(); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("ping mysql: %w", err)

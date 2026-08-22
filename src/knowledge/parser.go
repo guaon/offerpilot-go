@@ -114,7 +114,7 @@ func detectDimension(path string) string {
 
 func extractQuestions(content string) []parseQuestion {
 	var questions []parseQuestion
-	qBlocks := regexp.MustCompile(`^#{2,3}\s*Q[：:]`).Split(content, -1) //按问答标记分割内容
+	qBlocks := regexp.MustCompile(`(?m)^#{2,3}\s*Q[：:]`).Split(content, -1) // 按问答标记分割内容（(?m) 多行模式）
 	if len(qBlocks) <= 1 {
 		return questions
 	}
@@ -135,6 +135,10 @@ func extractQuestions(content string) []parseQuestion {
 
 		//提取新手答
 		noviceMatch := regexp.MustCompile(`\*\*新手答\*\*[：:]?\s*"?(.+?)"?\s*(?:\n|$)`).FindStringSubmatch(block)
+		var noviceAnswer string
+		if noviceMatch != nil && len(noviceMatch) >= 2 {
+			noviceAnswer = strings.TrimSpace(noviceMatch[1])
+		}
 
 		//提取高手答
 		expertStartMatch := regexp.MustCompile(`\*\*高手答\*\*[：:]?\s*\n`).FindStringIndex(block)
@@ -156,7 +160,7 @@ func extractQuestions(content string) []parseQuestion {
 
 		questions = append(questions, parseQuestion{
 			question:     question,
-			noviceAnswer: strings.TrimSpace(noviceMatch[1]),
+			noviceAnswer: noviceAnswer,
 			expertAnswer: expertAnswer,
 		})
 
