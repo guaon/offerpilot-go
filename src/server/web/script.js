@@ -1,7 +1,8 @@
 // ===== state =====
 var STORAGE={sessions:'offerpilot_sessions',current:'offerpilot_current',model:'offerpilot_model',collapsed:'offerpilot_sidebar_collapsed'};
 var MODELS=[{id:'deepseek-v4-flash',label:'deepseek-v4-flash'},{id:'deepseek-v3',label:'deepseek-v3'},{id:'claude-sonnet-4.5',label:'claude-sonnet-4.5'},{id:'gpt-4o',label:'gpt-4o'}];
-var state={sessions:{},order:[],currentSid:'',model:MODELS[0].id,streaming:false};
+var state={sessions:{},order:[],currentSid:'',model:MODELS[0].id,streaming:false,files:[]};
+var resumePageImages=[];
 function uid(){return 's_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,7);}
 function $(id){return document.getElementById(id);}
 var welcome=$('welcome'),chat=$('chat'),input=$('input'),composer=$('composer'),sendBtn=$('sendBtn');
@@ -19,6 +20,7 @@ var jdFileInput=$('jdFileInput'),jdUploadBtn=$('jdUploadBtn'),jdUploadStatus=$('
 var matchResumeFileInput=$('matchResumeFileInput'),matchResumeUploadBtn=$('matchResumeUploadBtn'),matchResumeUploadStatus=$('matchResumeUploadStatus');
 var authLink=$('auth-link');
 var dock=document.querySelector('.dock');
+var chatFileInput=$('chatFileInput'),uploadBtn=$('uploadBtn'),fileChips=$('fileChips');
 function loadAll(){
   try{state.sessions=JSON.parse(localStorage.getItem(STORAGE.sessions)||'{}');}catch(e){state.sessions={};}
   state.currentSid=localStorage.getItem(STORAGE.current)||'';
@@ -32,19 +34,20 @@ function fetchSessionsFromServer(){
     .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})
     .then(function(data){
       var list=data.sessions||[];
-      var merged={};
+      var changed=false;
       list.forEach(function(s){
-        merged[s.id]={id:s.id,title:s.title||'会话',messages:[],createdAt:s.updatedAt||0,updatedAt:s.updatedAt||0};
+        // 服务端有的会话但本地没有，补充到本地
+        if(!state.sessions[s.id]){
+          state.sessions[s.id]={id:s.id,title:'会话',messages:[],createdAt:s.updatedAt||0,updatedAt:s.updatedAt||0};
+          changed=true;
+        }
       });
-      // 合并服务端数据：服务端已有的用服务端的，本地独有的保留
-      for(var sid in state.sessions){
-        if(!merged[sid])merged[sid]=state.sessions[sid];
+      if(changed){
+        saveSessions();
+        rebuildOrder();
+        renderSidebar();
+        renderSessionsBar();
       }
-      state.sessions=merged;
-      saveSessions();
-      rebuildOrder();
-      renderSidebar();
-      renderSessionsBar();
     })
     .catch(function(){}); // 服务端不可用时静默降级到 localStorage
 }
@@ -59,7 +62,6 @@ function createSession(){
     saveSessions();rebuildOrder();
     return cur;
   }
-  // 同步生成本地 ID 作为即时 fallback
   var sid=uid();
   state.sessions[sid]={id:sid,title:'新会谈',messages:[],createdAt:Date.now(),updatedAt:Date.now()};
   state.currentSid=sid;saveSessions();localStorage.setItem(STORAGE.current,sid);rebuildOrder();
@@ -67,7 +69,8 @@ function createSession(){
   fetch('/api/session/new',{method:'POST',credentials:'include'})
     .then(function(r){if(r.ok)return r.json();return null;})
     .then(function(d){
-      if(d&&d.sessionId&&d.sessionId!==sid){
+      // 仅当用户没有切到其他会话时才替换
+      if(d&&d.sessionId&&d.sessionId!==sid&&state.currentSid===sid&&state.sessions[sid]){
         state.sessions[d.sessionId]=state.sessions[sid];
         state.sessions[d.sessionId].id=d.sessionId;
         delete state.sessions[sid];
@@ -91,13 +94,137 @@ function relTime(ts){
 function escapeHtml(s){return (s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function renderMarkdown(text){
   var safe=escapeHtml(text||'');
-  // 先处理 rich block
+  // 先处理 rich block 和代码块（保持原有逻辑）
   safe=safe.replace(/```rich\n([\s\S]*?)```/g,function(m,json){return renderRichBlock(json);});
   safe=safe.replace(/```([\s\S]*?)```/g,function(m,code){return '<pre><code>'+code+'</code></pre>';});
-  safe=safe.replace(/`([^`]+)`/g,'<code>$1</code>');
-  safe=safe.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
-  safe=safe.replace(/\n/g,'<br/>');
-  return safe;
+
+  // 按行分割，逐行解析块级语法
+  var lines=safe.split('\n');
+  var blocks=[];
+  var i=0;
+  while(i<lines.length){
+    var line=lines[i];
+    // 空行作为段落分隔
+    if(line.trim()===''){
+      i++;
+      continue;
+    }
+    // 水平线
+    if(/^-{3,}$/.test(line.trim())){
+      blocks.push('<hr/>');
+      i++;
+      continue;
+    }
+    // 标题
+    var hMatch=line.match(/^(#{1,3})\s+(.+)/);
+    if(hMatch){
+      var level=hMatch[1].length;
+      var content=hMatch[2];
+      // 对标题内容做 inline 格式化
+      content=formatInline(content);
+      blocks.push('<h'+level+'>'+content+'</h'+level+'>');
+      i++;
+      continue;
+    }
+    // 无序列表项
+    var ulMatch=line.match(/^(\s*)[-*+]\s+(.+)/);
+    if(ulMatch){
+      var items=[];
+      while(i<lines.length){
+        var m=lines[i].match(/^(\s*)[-*+]\s+(.+)/);
+        if(m){
+          items.push('<li>'+formatInline(m[2])+'</li>');
+          i++;
+        }else break;
+      }
+      blocks.push('<ul>'+items.join('')+'</ul>');
+      continue;
+    }
+    // 有序列表项
+    var olMatch=line.match(/^(\s*)(\d+)\.\s+(.+)/);
+    if(olMatch){
+      var olItems=[];
+      while(i<lines.length){
+        var om=lines[i].match(/^(\s*)(\d+)\.\s+(.+)/);
+        if(om){
+          olItems.push('<li>'+formatInline(om[3])+'</li>');
+          i++;
+        }else break;
+      }
+      blocks.push('<ol>'+olItems.join('')+'</ol>');
+      continue;
+    }
+    // 表格行（连续以 | 分隔的行，且至少有一个分隔行）
+    if(/^\s*\|/.test(line)&&/\|\s*$/.test(line.trim())){
+      // 向前查找是否存在分隔行
+      var tmpI=i;
+      var hasSep=false;
+      while(tmpI<lines.length){
+        var tl=lines[tmpI].trim();
+        if(tl==='')break;
+        if(/^\|[\s\-:]+\|$/.test(tl)){hasSep=true;break;}
+        if(!/^\s*\|/.test(tl)||!/\|\s*$/.test(tl))break;
+        tmpI++;
+      }
+      if(hasSep){
+        var headerRow=parseTableRow(line);
+        i++;
+        // 吃掉分隔行
+        if(i<lines.length&&/^\|[\s\-:]+\|$/.test(lines[i].trim()))i++;
+        var dataRows=[];
+        while(i<lines.length){
+          var dl=lines[i].trim();
+          if(dl===''||!/^\s*\|/.test(dl)||!/\|\s*$/.test(dl))break;
+          dataRows.push(parseTableRow(dl));
+          i++;
+        }
+        // 生成表格 HTML
+        var tblHtml='<table class="md-table"><thead><tr>';
+        headerRow.forEach(function(c){tblHtml+='<th>'+formatInline(c)+'</th>';});
+        tblHtml+='</tr></thead><tbody>';
+        dataRows.forEach(function(row){
+          tblHtml+='<tr>';
+          row.forEach(function(c){tblHtml+='<td>'+formatInline(c)+'</td>';});
+          tblHtml+='</tr>';
+        });
+        tblHtml+='</tbody></table>';
+        blocks.push(tblHtml);
+        continue;
+      }
+    }
+    // 普通段落（连续非空、非块级行合并为一个段落）
+    var paraLines=[];
+    while(i<lines.length){
+      var pl=lines[i];
+      if(pl.trim()==='' || /^#{1,3}\s+/.test(pl) || /^-{3,}$/.test(pl.trim()) ||
+         /^(\s*)[-*+]\s+/.test(pl) || /^(\s*)\d+\.\s+/.test(pl) ||
+         (/^\s*\|/.test(pl)&&/\|\s*$/.test(pl.trim()))){
+        break;
+      }
+      paraLines.push(pl);
+      i++;
+    }
+    if(paraLines.length){
+      var paraText=paraLines.join(' ');
+      paraText=formatInline(paraText);
+      blocks.push('<p>'+paraText+'</p>');
+    }
+  }
+  return blocks.join('');
+}
+// inline 格式化：加粗、行内代码
+function formatInline(text){
+  text=text.replace(/`([^`]+)`/g,'<code>$1</code>');
+  text=text.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+  return text;
+}
+// 解析表格行，按 | 分割单元格（去除首尾空单元格）
+function parseTableRow(line){
+  var cells=line.split('|');
+  // 去除首尾空元素（因为 | 开头和结尾会产生空字符串）
+  if(cells.length&&cells[0].trim()==='')cells.shift();
+  if(cells.length&&cells[cells.length-1].trim()==='')cells.pop();
+  return cells.map(function(c){return c.trim();});
 }
 function renderRichBlock(json){
   try{
@@ -233,6 +360,7 @@ function createAndRenderSession(){
   welcome.classList.remove('hidden');
   chat.classList.add('hidden');
   chat.innerHTML='';
+  state.files=[];renderFileChips();
   renderSessionsBar();
   renderSidebar();
   setTimeout(function(){try{input.focus();}catch(e){}},0);
@@ -347,6 +475,8 @@ function renderSessionsBar(){
 }
 function switchSession(sid){
   if(!state.sessions[sid])return;
+  // 切走前持久化当前会话
+  saveSessions();
   state.currentSid=sid;
   localStorage.setItem(STORAGE.current,sid);
   var s=state.sessions[sid];
@@ -358,7 +488,7 @@ function renderMessages(messages){
   welcome.classList.add('hidden');
   chat.classList.remove('hidden');
   chat.innerHTML='';
-  (messages||[]).forEach(function(m){appendMessageEl(m.role,m.content,{streaming:false,thinking:m.thinking||''});});
+  (messages||[]).forEach(function(m){appendMessageEl(m.role,m.content,{streaming:false,thinking:m.thinking||'',files:m.files||[]});});
   scrollToBottom();
 }
 function appendMessageEl(role,content,opts){
@@ -397,7 +527,19 @@ function appendMessageEl(role,content,opts){
     // 纯思考中状态（还没正文输出）的样式提示
     if(opts.thinking&&!content)div.classList.add('thinking');
   }else{
-    body.textContent=content;
+    // user message: show file chips first, then text
+    if(opts.files&&opts.files.length>0){
+      var fc=document.createElement('div');
+      fc.className='msg-files';
+      opts.files.forEach(function(f){
+        var chip=document.createElement('span');
+        chip.className='file-chip';
+        chip.innerHTML='<span class="file-chip-icon">📄</span><span class="file-chip-name">'+escapeHtml(f.name)+'</span><span class="file-chip-size">'+formatSize(f.size)+'</span>';
+        fc.appendChild(chip);
+      });
+      body.appendChild(fc);
+    }
+    body.appendChild(document.createTextNode(content));
   }
   div.appendChild(body);
   chat.appendChild(div);
@@ -408,38 +550,44 @@ function scrollToBottom(){requestAnimationFrame(function(){chat.scrollTop=chat.s
 function updateStreamingContent(accum){
   var last=chat.querySelector('.msg.assistant.streaming');
   if(!last)return;
-  var content=last.querySelector('.msg-content');
-  if(!content){
-    content=document.createElement('div');
-    content.className='msg-content';
-    last.querySelector('.msg-body').appendChild(content);
+  // 确保 content 容器存在
+  if(!last.querySelector('.msg-content')){
+    var c=document.createElement('div');
+    c.className='msg-content';
+    last.querySelector('.msg-body').appendChild(c);
   }
-  if(accum.text){
-    last.classList.remove('thinking');
-    content.innerHTML=renderMarkdown(accum.text);
-  }else if(accum.thinking){
-    last.classList.add('thinking');
-    // 确保存在 think-block，并写入推理文本
-    var block=last.querySelector('.think-block');
-    if(!block)block=getThinkBlock();
-    // 在 think-block 内找/建推理条目
-    var thinkingEntry=block.querySelector('.think-entry.thinking-main');
-    if(!thinkingEntry){
-      thinkingEntry=document.createElement('div');
-      thinkingEntry.className='think-entry thinking-main';
-      thinkingEntry.innerHTML='<span class="think-tag">推理</span> <span class="think-detail"></span>';
-      block.appendChild(thinkingEntry);
+  // 节流：用 RAF 合并高频更新，避免大文本（如简历）时页面卡死
+  if(last._rafId)return;
+  last._rafId=requestAnimationFrame(function(){
+    last._rafId=null;
+    var content=last.querySelector('.msg-content');
+    if(!content)return;
+    if(accum.text){
+      last.classList.remove('thinking');
+      content.innerHTML=renderMarkdown(accum.text);
+    }else if(accum.thinking){
+      last.classList.add('thinking');
+      var block=last.querySelector('.think-block');
+      if(!block)block=getThinkBlock();
+      var thinkingEntry=block.querySelector('.think-entry.thinking-main');
+      if(!thinkingEntry){
+        thinkingEntry=document.createElement('div');
+        thinkingEntry.className='think-entry thinking-main';
+        thinkingEntry.innerHTML='<span class="think-tag">推理</span> <span class="think-detail"></span>';
+        block.appendChild(thinkingEntry);
+      }
+      var detailEl=thinkingEntry.querySelector('.think-detail');
+      if(detailEl)detailEl.innerHTML=escapeHtml(accum.thinking).replace(/\n/g,'<br/>');
     }
-    var detailEl=thinkingEntry.querySelector('.think-detail');
-    if(detailEl)detailEl.innerHTML=escapeHtml(accum.thinking).replace(/\n/g,'<br/>');
-  }
-  scrollToBottom();
+    scrollToBottom();
+  });
 }
 function finishStreamingContent(accum){
   var last=chat.querySelector('.msg.assistant.streaming');
   if(!last)return;
+  // 取消待处理的 RAF，直接用最终内容渲染
+  if(last._rafId){cancelAnimationFrame(last._rafId);last._rafId=null;}
   last.classList.remove('streaming');
-  // 折叠思考过程（保持折叠块存在，不要覆盖它）
   var tb=last.querySelector('.think-block');if(tb)tb.open=false;
   var content=last.querySelector('.msg-content');
   if(!content){
@@ -726,26 +874,36 @@ async function diagnoseResume(){
   resumeDiagnoseBtn.disabled=true;resumeDiagnoseBtn.textContent='诊断中...';
   resumeStatus.textContent='';resumeResults.innerHTML='';
   try{
-    var res=await fetch('/api/resume',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify({content:text})});
+    var res=await fetch('/api/resume',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify({content:text,images:resumePageImages})});
     var data=await res.json();
-    if(!res.ok)throw new Error(data.error||('HTTP '+res.status));
-    renderResumeDiagnosis(data.diagnosis||[]);
-    resumeStatus.textContent='诊断完成';
+    if(!res.ok)throw new Error(typeof data.error==='string'?data.error:(data.error&&data.error.message)||('HTTP '+res.status));
+    renderResumeDiagnosis(data);
+    resumeStatus.textContent=(data.mode==='multimodal'?'视觉 + 文字':'纯文字')+'诊断完成';
   }catch(e){
     resumeResults.innerHTML='<div class="diag-empty" style="color:#b91c1c">诊断失败: '+escapeHtml(e.message)+'</div>';
   }finally{
-    resumeDiagnoseBtn.disabled=false;resumeDiagnoseBtn.textContent='开始诊断';
+    resumeDiagnoseBtn.disabled=false;resumeDiagnoseBtn.textContent='多模态诊断';
   }
 }
-function renderResumeDiagnosis(items){
-  if(!items.length){resumeResults.innerHTML='<div class="diag-empty">没有发现问题，简历写得很棒 🎉</div>';return;}
-  resumeResults.innerHTML=items.map(function(it){
+function renderResumeDiagnosis(result){
+  var items=result.diagnosis||[];
+  if(!items.length){resumeResults.innerHTML='<div class="diag-empty">没有可展示的诊断结果</div>';return;}
+  var html='<div class="diag-item"><div class="diag-head"><span>综合评价</span><span class="diag-score">'+(result.overallScore||0)+'/100</span></div>'
+    +'<div class="diag-suggestions">'+escapeHtml(result.summary||'')+'</div></div>';
+  html+=items.map(function(it){
     return '<div class="diag-item">'
       +'<div class="diag-head"><span>'+escapeHtml(it.section||'(未命名段落)')+'</span><span class="diag-score">'+it.score+'/10</span></div>'
-      +(it.issues&&it.issues.length?'<div class="diag-issues">⚠ '+escapeHtml(it.issues.join(' · '))+'</div>':'')
-      +'<div class="diag-suggestions">💡 '+escapeHtml((it.suggestions||[]).join(' · '))+'</div>'
+      +(it.evidence&&it.evidence.length?'<div class="diag-suggestions">证据：'+escapeHtml(it.evidence.join(' · '))+'</div>':'')
+      +(it.issues&&it.issues.length?'<div class="diag-issues">问题：'+escapeHtml(it.issues.join(' · '))+'</div>':'')
+      +'<div class="diag-suggestions">建议：'+escapeHtml((it.suggestions||[]).join(' · '))+'</div>'
+      +(it.rewrite?'<div class="diag-suggestions">改写：'+escapeHtml(it.rewrite)+'</div>':'')
       +'</div>';
   }).join('');
+  if(result.layout){
+    html+='<div class="diag-item"><div class="diag-head"><span>版式评价</span><span class="diag-score">'+(result.layout.score||0)+'/10</span></div>'
+      +'<div class="diag-suggestions">'+escapeHtml(result.layout.summary||'')+'</div></div>';
+  }
+  resumeResults.innerHTML=html;
 }
 
 // ===== JD match =====
@@ -796,18 +954,44 @@ function renderMatchResult(d){
 }
 
 // ===== file upload =====
+async function parseUploadedFile(file,renderPages){
+  var name=(file.name||'').toLowerCase();
+  if(name.endsWith('.pdf')){
+    try{
+      var reader=await import('/pdf-reader.mjs');
+      return await reader.readPDF(file,{renderPages:!!renderPages,maxRenderedPages:3});
+    }catch(browserError){
+      // Keep the original Go parser as a compatibility fallback. PDF.js is
+      // the primary path because its local CMaps correctly decode CID fonts.
+      try{
+        return await parseUploadedFileOnServer(file);
+      }catch(serverError){
+        throw new Error('PDF.js: '+browserError.message+'; 服务端回退: '+serverError.message);
+      }
+    }
+  }
+  return parseUploadedFileOnServer(file);
+}
+async function parseUploadedFileOnServer(file){
+  var fd=new FormData();fd.append('file',file);
+  var res=await fetch('/api/parse-pdf',{method:'POST',body:fd,credentials:'include'});
+  var data=await res.json();
+  if(!res.ok)throw new Error(data.error||('HTTP '+res.status));
+  return data;
+}
 async function uploadFile(file, statusEl, targetTextarea){
   if(!file)return;
   if(file.size>10*1024*1024){statusEl.textContent='文件超过 10MB';return;}
   statusEl.textContent='解析中...';
-  var fd=new FormData();fd.append('file',file);
   try{
-    var res=await fetch('/api/parse-pdf',{method:'POST',body:fd,credentials:'include'});
-    var data=await res.json();
-    if(!res.ok)throw new Error(data.error||('HTTP '+res.status));
+    var isResume=targetTextarea===resumeInput;
+    var data=await parseUploadedFile(file,isResume);
     targetTextarea.value=data.text||'';
-    statusEl.textContent='已解析 '+(data.pages?data.pages+' 页 · ':'')+(data.text?data.text.length:'0')+' 字';
+    if(isResume)resumePageImages=data.pageImages||[];
+    statusEl.textContent='已解析 '+(data.pages?data.pages+' 页 · ':'')+(data.text?data.text.length:'0')+' 字'
+      +(isResume&&resumePageImages.length?' · 视觉 '+resumePageImages.length+' 页':'');
   }catch(e){
+    if(targetTextarea===resumeInput)resumePageImages=[];
     statusEl.textContent='解析失败: '+e.message;
   }
 }
@@ -827,22 +1011,102 @@ function bindUpload(btn, fileInput, statusEl, targetTextarea){
   });
 }
 
+// ===== chat file upload =====
+function initChatUpload(){
+  if(!uploadBtn||!chatFileInput||!input)return;
+  uploadBtn.addEventListener('click',function(){chatFileInput.click();});
+  chatFileInput.addEventListener('change',function(){
+    if(chatFileInput.files.length)uploadToChat(chatFileInput.files[0]);
+    chatFileInput.value='';
+  });
+  // drag-and-drop on chat area
+  var main=document.querySelector('.main');
+  if(!main)return;
+  main.addEventListener('dragover',function(e){e.preventDefault();main.classList.add('upload-drag-over');});
+  main.addEventListener('dragleave',function(e){
+    if(e.target===main)main.classList.remove('upload-drag-over');
+  });
+  main.addEventListener('drop',function(e){
+    e.preventDefault();main.classList.remove('upload-drag-over');
+    if(e.dataTransfer.files.length)uploadToChat(e.dataTransfer.files[0]);
+  });
+}
+function formatSize(bytes){
+  if(bytes<1024)return bytes+' B';
+  if(bytes<1048576)return (bytes/1024).toFixed(1)+' KB';
+  return (bytes/1048576).toFixed(1)+' MB';
+}
+async function uploadToChat(file){
+  if(!file)return;
+  if(file.size>10*1024*1024){showToast('文件超过 10MB');return;}
+  var orig=uploadBtn.innerHTML;
+  uploadBtn.innerHTML='<span class="upload-spin">⏳</span>';
+  uploadBtn.disabled=true;
+  try{
+    var data=await parseUploadedFile(file,false);
+    var text=data.text||'';
+    if(!text.trim()){showToast('文件解析为空');return;}
+    state.files.push({name:file.name,size:file.size,content:text});
+    renderFileChips();
+    showToast('已添加 '+file.name);
+  }catch(e){
+    showToast('解析失败: '+e.message);
+  }finally{
+    uploadBtn.innerHTML=orig;
+    uploadBtn.disabled=false;
+  }
+}
+function renderFileChips(){
+  if(!fileChips)return;
+  fileChips.innerHTML='';
+  state.files.forEach(function(f,i){
+    var chip=document.createElement('div');
+    chip.className='file-chip';
+    chip.innerHTML='<span class="file-chip-icon">📄</span><span class="file-chip-name">'+escapeHtml(f.name)+'</span><span class="file-chip-size">'+formatSize(f.size)+'</span><button class="file-chip-remove" data-idx="'+i+'" type="button">×</button>';
+    chip.querySelector('.file-chip-remove').addEventListener('click',function(e){
+      e.stopPropagation();
+      state.files.splice(i,1);
+      renderFileChips();
+    });
+    fileChips.appendChild(chip);
+  });
+}
+function escapeHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function showToast(msg){
+  var t=document.createElement('div');
+  t.className='toast';t.textContent=msg;
+  document.body.appendChild(t);
+  setTimeout(function(){t.classList.add('toast-out');},2000);
+  setTimeout(function(){if(t.parentNode)t.parentNode.removeChild(t);},2500);
+}
+
 // ===== submit & stream =====
 async function submit(){
   var text=input.value.trim();
+  var attachedFiles=state.files.slice(); // 保存引用用于显示
+  // 拼接文件内容发送给后端
+  if(state.files.length>0){
+    var fileTexts=state.files.map(function(f){
+      return '[上传文件: '+f.name+']\n'+f.content;
+    }).join('\n\n');
+    if(text) text=text+'\n\n'+fileTexts;
+    else text=fileTexts;
+    state.files=[];
+    renderFileChips();
+  }
   if(!text||state.streaming)return;
   if(!state.currentSid)createSession();
   var session=getSession(state.currentSid);
   if(!session)return;
-  var userMsg={role:'user',content:text};
+  var userMsg={role:'user',content:text,files:attachedFiles};
   session.messages.push(userMsg);
   session.updatedAt=Date.now();
-  if(session.title==='新会谈'||!session.title)session.title=autoTitle(text);
+  if(session.title==='新会谈'||!session.title)session.title=autoTitle(input.value.trim()||text);
   saveSessions();
   renderSessionsBar();
   welcome.classList.add('hidden');
   chat.classList.remove('hidden');
-  appendMessageEl('user',text,{streaming:false});
+  appendMessageEl('user',input.value.trim()||'',{streaming:false,files:attachedFiles});
   input.value='';input.style.height='auto';
   appendMessageEl('assistant','',{streaming:true});
   state.streaming=true;sendBtn.disabled=true;
@@ -889,7 +1153,6 @@ function handleEvent(evt,accum,session){
   switch(evt.type){
     case 'text_delta':
     accum.text+=evt.content||'';
-    // 第一个文本到达时，折叠思考过程
     if(accum.text.length===evt.content.length||0){
       var last=chat.querySelector('.msg.assistant.streaming');
       if(last){var tb=last.querySelector('.think-block');if(tb)tb.open=false;}
@@ -903,19 +1166,24 @@ function handleEvent(evt,accum,session){
     case 'session':
       var serverSid=evt.sessionId;
       if(serverSid&&serverSid!==state.currentSid){
-        var oldSid=state.currentSid;
-        if(oldSid&&state.sessions[oldSid]){
-          state.sessions[serverSid]=state.sessions[oldSid];
-          state.sessions[serverSid].id=serverSid;
-          delete state.sessions[oldSid];
+        var existing=state.sessions[serverSid];
+        if(existing&&existing.messages&&existing.messages.length>0){
+          state.currentSid=serverSid;
+          localStorage.setItem(STORAGE.current,serverSid);
+        }else{
+          var oldSid=state.currentSid;
+          if(oldSid&&state.sessions[oldSid]){
+            state.sessions[serverSid]=state.sessions[oldSid];
+            state.sessions[serverSid].id=serverSid;
+            delete state.sessions[oldSid];
+          }
+          state.currentSid=serverSid;
+          localStorage.setItem(STORAGE.current,serverSid);
+          saveSessions();
         }
-        state.currentSid=serverSid;
-        localStorage.setItem(STORAGE.current,serverSid);
-        saveSessions();
       }
       break;
   }
-  scrollToBottom();
 }
 function onStreamDone(accum,session){
   finishStreamingContent(accum);
@@ -969,9 +1237,11 @@ function bindEvents(){
   }
   // 简历诊断
   if(resumeDiagnoseBtn)resumeDiagnoseBtn.addEventListener('click',diagnoseResume);
+  if(resumeInput)resumeInput.addEventListener('input',function(){resumePageImages=[];});
   if(resumeAIBtn)resumeAIBtn.addEventListener('click',function(){
     var text=resumeInput.value.trim();
-    jumpToChat('请帮我诊断以下简历：\n\n'+text);
+    if(!text){resumeStatus.textContent='请先上传或粘贴简历';return;}
+    jumpToChat('请基于以下简历为我进行个性化模拟面试。先调用 mock_interview，resumeText 必须传入完整简历，每次只问一道题，并优先核验项目职责、技术决策和量化结果。\n\n【候选人简历】\n'+text);
   });
   // JD匹配
   if(matchBtn)matchBtn.addEventListener('click',runMatch);
@@ -991,6 +1261,7 @@ function init(){
   loadAll();
   renderModelMenu();
   bindEvents();
+  initChatUpload();
   fetchUser();
   if(state.currentSid&&state.sessions[state.currentSid]){
     renderMessages(state.sessions[state.currentSid].messages);

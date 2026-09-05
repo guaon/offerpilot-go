@@ -466,6 +466,31 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;paddin
 /* 正文内容容器（在 assistant 消息中位于 think-block 之下） */
 .msg-content{display:block}
 .msg-content:empty{display:none}
+/* Markdown 渲染样式 */
+.msg-content h1{font-size:20px;font-weight:600;margin:0 0 14px;letter-spacing:.3px}
+.msg-content h2{font-size:17px;font-weight:600;margin:18px 0 10px;letter-spacing:.2px}
+.msg-content h3{font-size:15px;font-weight:600;margin:14px 0 8px}
+.msg-content h2:first-child,.msg-content h3:first-child{margin-top:0}
+.msg-content p{margin:0 0 10px;line-height:1.7}
+.msg-content p:first-child{margin-top:0}
+.msg-content ul,.msg-content ol{margin:0 0 10px;padding-left:22px}
+.msg-content ul{list-style:none}
+.msg-content ul>li{position:relative;padding-left:14px;margin-bottom:6px;line-height:1.7}
+.msg-content ul>li::before{content:'•';position:absolute;left:0;color:var(--accent)}
+.msg-content ol{padding-left:24px}
+.msg-content ol>li{margin-bottom:6px;line-height:1.7}
+.msg-content hr{border:none;border-top:1px solid var(--line);margin:14px 0}
+.msg-content code{background:#f5f5f4;padding:1px 6px;border-radius:4px;font-size:13px}
+.msg-content pre{background:#f5f5f4;padding:10px 12px;border-radius:8px;overflow-x:auto;font-size:13px;margin:0 0 10px}
+.msg-content pre code{background:none;padding:0}
+.msg-content strong{font-weight:600}
+.msg-content h1,.msg-content h2,.msg-content h3{display:flex;align-items:center;gap:6px}
+/* Markdown 表格 */
+.md-table{width:100%;border-collapse:collapse;margin:10px 0;font-size:14px}
+.md-table th{text-align:left;padding:10px 14px;background:#fafaf9;border-bottom:2px solid var(--line);font-weight:600;color:var(--text);font-size:14px}
+.md-table td{padding:10px 14px;border-bottom:1px solid var(--line);color:var(--text-soft);line-height:1.6}
+.md-table tr:last-child td{border-bottom:none}
+.md-table tr:hover td{background:#fafaf9}
 
 /* 思考过程折叠块（嵌在 msg-body 内部顶部，正文内容之上） */
 .think-block{
@@ -601,8 +626,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;paddin
   max-width:760px;
   margin:0 auto;
   display:flex;
-  align-items:flex-end;
-  gap:8px;
+  flex-direction:column;
   padding:10px 10px 10px 16px;
   background:#fff;
   border:1px solid var(--line);
@@ -611,6 +635,12 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;paddin
   transition:border-color .15s;
 }
 .composer:focus-within{border-color:var(--accent)}
+.composer-body{display:flex;flex-direction:column;gap:0}
+.composer-row{
+  display:flex;
+  align-items:flex-end;
+  gap:8px;
+}
 .composer textarea{
   flex:1 1 auto;
   min-width:0;
@@ -639,6 +669,59 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;paddin
 .send-btn:hover{background:var(--accent-strong)}
 .send-btn:disabled{background:var(--text-faint);cursor:not-allowed}
 .send-arrow{font-size:18px;line-height:1;font-weight:600}
+
+.upload-btn{
+  flex:0 0 auto;
+  width:36px;height:36px;
+  border-radius:10px;
+  background:transparent;
+  color:var(--text-faint);
+  display:grid;
+  place-items:center;
+  transition:all .15s;
+  cursor:pointer;
+}
+.upload-btn:hover{color:var(--accent);background:var(--bg);}
+.upload-btn:disabled{opacity:.5;cursor:not-allowed}
+.upload-spin{animation:spin .8s linear infinite;display:inline-block;font-size:16px}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+.upload-drag-over{outline:2px dashed var(--accent);outline-offset:-4px}
+
+.file-chips{
+  display:flex;flex-wrap:wrap;gap:6px;
+  padding:0 0 8px 0;
+}
+.file-chips:empty{display:none}
+.file-chip{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:4px 8px 4px 10px;
+  background:var(--bg);border:1px solid var(--line);
+  border-radius:8px;font-size:12px;color:var(--text);
+  max-width:260px;
+}
+.file-chip-icon{font-size:14px;flex-shrink:0}
+.file-chip-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.file-chip-size{color:var(--text-faint);flex-shrink:0}
+.file-chip-remove{
+  flex-shrink:0;width:18px;height:18px;border-radius:50%;
+  border:none;background:transparent;color:var(--text-faint);
+  cursor:pointer;display:grid;place-items:center;font-size:14px;line-height:1;
+  transition:all .15s;
+}
+.file-chip-remove:hover{background:var(--line);color:var(--text)}
+
+.msg-files{
+  display:flex;flex-wrap:wrap;gap:4px;
+  margin-bottom:6px;
+}
+
+.toast{
+  position:fixed;bottom:100px;left:50%;transform:translateX(-50%);
+  background:var(--text);color:#fff;padding:8px 18px;border-radius:8px;
+  font-size:13px;z-index:9999;opacity:1;transition:opacity .3s;
+}
+.toast-out{opacity:0}
 
 .dock-foot{
   max-width:760px;

@@ -48,6 +48,9 @@ func (sm *SessionManager) EnsureLoaded() {
 }
 
 func (sm *SessionManager) Create(userID string) *Session {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
 	now := time.Now().UnixMilli()
 
 	s := &Session{
@@ -78,9 +81,18 @@ func (sm *SessionManager) Create(userID string) *Session {
 
 // ClaimSession 将匿名会话归属到指定用户（登录认领）。
 func (sm *SessionManager) ClaimSession(sessionID, userID string) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
 	s := sm.sessions[sessionID]
 	if s == nil {
 		return fmt.Errorf("session %s not found", sessionID)
+	}
+	if userID == "" {
+		return fmt.Errorf("user ID is required")
+	}
+	if s.Metadata.UserID != "" && s.Metadata.UserID != userID {
+		return fmt.Errorf("permission denied")
 	}
 	s.Metadata.UserID = userID
 	s.UpdatedAt = time.Now().UnixMilli()
@@ -93,8 +105,26 @@ func (sm *SessionManager) ClaimSession(sessionID, userID string) error {
 	return nil
 }
 
+// CanAccess reports whether the session belongs to the supplied user. Anonymous
+// callers may only access sessions that have not been claimed by an account.
+func (sm *SessionManager) CanAccess(sessionID, userID string) bool {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	s := sm.sessions[sessionID]
+	if s == nil && sm.db != nil {
+		if err := sm.loadSessionFromDB(sessionID); err == nil {
+			s = sm.sessions[sessionID]
+		}
+	}
+	return s != nil && s.Metadata.UserID == userID
+}
+
 // Transition 将指定会话从一个状态转换到另一个状态。
 func (sm *SessionManager) Transition(id string, newState SessionState) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
 	s := sm.sessions[id]
 	if s == nil {
 		return fmt.Errorf("session %s not found", id)
@@ -125,6 +155,9 @@ func (sm *SessionManager) Transition(id string, newState SessionState) error {
 }
 
 func (sm *SessionManager) Get(id string) (*Session, error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
 	s := sm.sessions[id]
 	if s == nil {
 		if sm.db != nil {
@@ -138,14 +171,25 @@ func (sm *SessionManager) Get(id string) (*Session, error) {
 }
 
 func (sm *SessionManager) GetMessages(id string) ([]*schema.Message, error) {
-	s, err := sm.Get(id)
-	if err != nil {
-		return nil, err
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	s := sm.sessions[id]
+	if s == nil {
+		if sm.db != nil {
+			if err := sm.loadSessionFromDB(id); err == nil && sm.sessions[id] != nil {
+				return sm.sessions[id].Messages, nil
+			}
+		}
+		return nil, fmt.Errorf("session %s not found", id)
 	}
 	return s.Messages, nil
 }
 
 func (sm *SessionManager) AddMessage(id string, message *schema.Message) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
 	s := sm.sessions[id]
 	if s == nil {
 		return fmt.Errorf("session %s not found", id)
@@ -197,6 +241,9 @@ func (sm *SessionManager) validTransitions(current SessionState) []SessionState 
 }
 
 func (sm *SessionManager) ReplaceMessages(id string, messages []*schema.Message) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
 	s := sm.sessions[id]
 	if s == nil {
 		return fmt.Errorf("session %s not found", id)
@@ -247,6 +294,9 @@ func (sm *SessionManager) ReplaceMessages(id string, messages []*schema.Message)
 }
 
 func (sm *SessionManager) Checkpoint(id string) (*CheckPoints, error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
 	s := sm.sessions[id]
 	if s == nil {
 		return nil, fmt.Errorf("session %s not found", id)
@@ -270,6 +320,9 @@ func (sm *SessionManager) Checkpoint(id string) (*CheckPoints, error) {
 
 // ReWind 回到检查点时的状态。
 func (sm *SessionManager) ReWind(sessionID string, checkpointID string) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
 	s := sm.sessions[sessionID]
 	if s == nil {
 		return fmt.Errorf("session %s not found", sessionID)
@@ -296,6 +349,9 @@ func (sm *SessionManager) ReWind(sessionID string, checkpointID string) error {
 }
 
 func (sm *SessionManager) ListActive() []*Session {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
 	var result []*Session
 	for _, s := range sm.sessions {
 		if s.State == SessionStateActive || s.State == SessionStatePaused {
@@ -337,7 +393,7 @@ func (sm *SessionManager) Delete(sessionID, userID string) error {
 	if s == nil {
 		return fmt.Errorf("session not found")
 	}
-	if s.Metadata.UserID != "" && s.Metadata.UserID != userID {
+	if s.Metadata.UserID != userID {
 		return fmt.Errorf("permission denied")
 	}
 

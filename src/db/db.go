@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -30,6 +31,12 @@ func Open() (*sql.DB, error) {
 		conn.Close()
 		return nil, fmt.Errorf("ping mysql: %w", err)
 	}
+
+	// 配置连接池
+	conn.SetMaxOpenConns(25)
+	conn.SetMaxIdleConns(10)
+	conn.SetConnMaxLifetime(5 * time.Minute)
+	conn.SetConnMaxIdleTime(2 * time.Minute)
 
 	return conn, nil
 }

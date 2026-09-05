@@ -37,6 +37,21 @@ func (kb *KnowledgeBuilder) Close() error {
 	return kb.db.Close()
 }
 
+// Clear 清空所有知识条目和嵌入向量，保留表结构。
+func (kb *KnowledgeBuilder) Clear() error {
+	queries := []string{
+		"DELETE FROM knowledge",
+		"DELETE FROM knowledge_fts",
+		"DELETE FROM embedding",
+	}
+	for _, q := range queries {
+		if _, err := kb.db.Exec(q); err != nil {
+			return fmt.Errorf("clear failed: %w", err)
+		}
+	}
+	return nil
+}
+
 func (kb *KnowledgeBuilder) BuildFromDir(dirPath string) error {
 	entries, err := ParseKnowledgeDir(dirPath)
 	if err != nil {

@@ -20,9 +20,9 @@ func userIDFromContext(ctx context.Context) string {
 	return ""
 }
 
-// requireAuth 尽力认证：有有效登录 cookie 则注入 userID（用于记忆/诊断隔离），
+// optionalAuth 尽力认证：有有效登录 cookie 则注入 userID（用于记忆/诊断隔离），
 // 无 cookie 也放行（未登录可对话，仅 /api/me 等需用户信息的接口会另行拦截）。
-func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+func (s *Server) optionalAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		if s.userService == nil {
 			next(w, req)
@@ -53,8 +53,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, req *http.Request) {
 		Email    string `json:"email"`
 		Password string `json:"password"`
 	}
-	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	if !decodeJSON(w, req, &body) {
 		return
 	}
 
@@ -64,8 +63,8 @@ func (s *Server) handleRegister(w http.ResponseWriter, req *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "username and password required"})
 		return
 	}
-	if len(body.Password) < 6 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "password too short (min 6)"})
+	if len(body.Password) < 8 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "password too short (min 8)"})
 		return
 	}
 
@@ -78,7 +77,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, req *http.Request) {
 	s.startAuthSession(w, u.ID)
 	s.claimSession(req, u.ID)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"ok": true,
+		"ok":   true,
 		"user": map[string]string{"id": u.ID, "username": u.Username, "email": u.Email},
 	})
 }
@@ -93,8 +92,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, req *http.Request) {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	if !decodeJSON(w, req, &body) {
 		return
 	}
 
@@ -107,7 +105,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, req *http.Request) {
 	s.startAuthSession(w, u.ID)
 	s.claimSession(req, u.ID)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"ok": true,
+		"ok":   true,
 		"user": map[string]string{"id": u.ID, "username": u.Username, "email": u.Email},
 	})
 }
@@ -160,6 +158,7 @@ func (s *Server) startAuthSession(w http.ResponseWriter, userID string) {
 		Value:    sessionID,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   envBool("COOKIE_SECURE"),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   30 * 24 * 3600,
 	})

@@ -11,7 +11,7 @@ const (
 	SubAgentRoleReporter        SubAgentRole = "reporter"
 	SubAgentRoleJDAnalyst       SubAgentRole = "jd-analyst"
 	SubAgentRoleResumeOptimizer SubAgentRole = "resume-optimizer"
-	SubAgentRoleGapAnalyzer      SubAgentRole = "gap-analyzer"
+	SubAgentRoleGapAnalyzer     SubAgentRole = "gap-analyzer"
 )
 
 type SubAgentConfig struct {

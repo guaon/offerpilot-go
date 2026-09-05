@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"net"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -24,9 +26,7 @@ import (
 	"MyOfferPilot/src/db"
 	"MyOfferPilot/src/logger"
 	"MyOfferPilot/src/memory"
-	"MyOfferPilot/src/realtime"
 	"MyOfferPilot/src/session"
-	tool "MyOfferPilot/src/tools"
 	"MyOfferPilot/src/user"
 
 	"github.com/cloudwego/eino/schema"
@@ -41,13 +41,16 @@ const (
 )
 
 type Server struct {
-	port        string
-	apiKey      string
-	httpServer  *http.Server
-	app         *app.App
-	userService *user.Service
-	mysqlDB     *sql.DB
-	mu          sync.Mutex
+	port              string
+	apiKey            string
+	httpServer        *http.Server
+	app               *app.App
+	userService       *user.Service
+	mysqlDB           *sql.DB
+	diagnoses         *diagnosisStore
+	diagnosisSvc      *DiagnosisService
+	trustProxyHeaders bool
+	mu                sync.Mutex
 }
 
 type ChatRequest struct {
@@ -57,14 +60,16 @@ type ChatRequest struct {
 }
 
 type ChatEvent struct {
-	Type       string                 `json:"type"`
-	Content    string                 `json:"content,omitempty"`
-	Name       string                 `json:"name,omitempty"`
-	Input      map[string]interface{} `json:"input,omitempty"`
-	Result     string                 `json:"result,omitempty"`
-	SessionID  string                 `json:"sessionId,omitempty"`
-	Usage      map[string]int         `json:"usage,omitempty"`
-	Error      string                 `json:"error,omitempty"`
+	Type      string                 `json:"type"`
+	Content   string                 `json:"content,omitempty"`
+	Action    string                 `json:"action,omitempty"`
+	Reason    string                 `json:"reason,omitempty"`
+	Name      string                 `json:"name,omitempty"`
+	Input     map[string]interface{} `json:"input,omitempty"`
+	Result    string                 `json:"result,omitempty"`
+	SessionID string                 `json:"sessionId,omitempty"`
+	Usage     map[string]int         `json:"usage,omitempty"`
+	Error     string                 `json:"error,omitempty"`
 }
 
 func NewServer(port string) *Server {
@@ -72,10 +77,13 @@ func NewServer(port string) *Server {
 		port = "3001"
 	}
 	s := &Server{
-		port:   port,
-		apiKey: os.Getenv("OFFERPILOT_API_KEY"),
+		port:              port,
+		apiKey:            os.Getenv("OFFERPILOT_API_KEY"),
+		diagnoses:         newDiagnosisStore(),
+		trustProxyHeaders: envBool("TRUST_PROXY_HEADERS"),
 	}
 	s.initAuth()
+	s.diagnosisSvc = s.newDiagnosisService()
 	return s
 }
 
@@ -104,41 +112,7 @@ func (s *Server) Start() error {
 	}
 	s.mu.Unlock()
 
-	mux := http.NewServeMux()
-	// 认证 API（公开）
-	mux.HandleFunc("/api/register", s.handleRegister)
-	mux.HandleFunc("/api/login", s.handleLogin)
-	mux.HandleFunc("/api/logout", s.handleLogout)
-	mux.HandleFunc("/api/me", s.requireAuth(s.handleMe))
-	// 业务 API（需登录）
-	mux.HandleFunc("/api/chat", s.requireAuth(s.handleChat))
-	mux.HandleFunc("/api/session", s.requireAuth(s.handleSession))
-	mux.HandleFunc("/api/session/new", s.requireAuth(s.handleSessionNew))
-	mux.HandleFunc("/api/sessions", s.requireAuth(s.handleSessions))
-	mux.HandleFunc("/api/transcribe", s.requireAuth(s.handleTranscribe))
-	mux.HandleFunc("/api/tts", s.requireAuth(s.handleTTS))
-	mux.HandleFunc("/api/config", s.requireAuth(s.handleConfig))
-	mux.HandleFunc("/api/diagnosis", s.requireAuth(s.handleDiagnosis))
-	mux.HandleFunc("/api/interview", s.requireAuth(s.handleInterview))
-	mux.HandleFunc("/api/match", s.requireAuth(s.handleMatch))
-	mux.HandleFunc("/api/resume", s.requireAuth(s.handleResume))
-	mux.HandleFunc("/api/parse-pdf", s.requireAuth(s.handleParsePDF))
-	mux.HandleFunc("/api/parse-url", s.requireAuth(s.handleParseURL))
-	mux.HandleFunc("/api/_next/", s.handleStaticFile)
-	mux.HandleFunc("/api/brand/", s.handleStaticFile)
-	mux.HandleFunc("/health", s.handleHealth)
-	mux.HandleFunc("/_next/", s.handleStaticFile)
-	mux.HandleFunc("/brand/", s.handleStaticFile)
-	mux.HandleFunc("/upload", s.handleUploadPage)
-	mux.HandleFunc("/upload.js", s.handleUploadJS)
-	mux.HandleFunc("/radar", s.handleRadar)
-	mux.HandleFunc("/login", s.handleLoginPage)
-	mux.HandleFunc("/", s.handleStaticOrSPA)
-
-	s.httpServer = &http.Server{
-		Addr:    ":" + s.port,
-		Handler: mux,
-	}
+	s.httpServer = s.newHTTPServer(s.buildHandler())
 
 	logger.DefaultLogger.Info("Server starting", map[string]interface{}{
 		"port": s.port,
@@ -148,9 +122,25 @@ func (s *Server) Start() error {
 	return s.httpServer.ListenAndServe()
 }
 
+func (s *Server) newHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              ":" + s.port,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+}
+
 func (s *Server) Stop() error {
 	logger.DefaultLogger.Info("Server stopping")
-	return s.httpServer.Shutdown(context.Background())
+	if s.httpServer == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return s.httpServer.Shutdown(ctx)
 }
 
 func (s *Server) validateAuth(req *http.Request) bool {
@@ -165,9 +155,53 @@ func (s *Server) validateAuth(req *http.Request) bool {
 }
 
 func (s *Server) cors(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-File-Name")
+}
+
+func (s *Server) canAccessSession(req *http.Request, sessionID, userID string) bool {
+	if sessionID == "" || s.app == nil || s.app.SessionManager == nil {
+		return false
+	}
+	if !s.app.SessionManager.CanAccess(sessionID, userID) {
+		return false
+	}
+	if userID != "" {
+		return true
+	}
+	cookie, err := req.Cookie("offerpilot_sid")
+	return err == nil && cookie.Value == sessionID
+}
+
+func (s *Server) diagnosisState() *diagnosisStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.diagnoses == nil {
+		s.diagnoses = newDiagnosisStore()
+	}
+	return s.diagnoses
+}
+
+func (s *Server) diagnosisService() *DiagnosisService {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.diagnosisSvc == nil {
+		if s.diagnoses == nil {
+			s.diagnoses = newDiagnosisStore()
+		}
+		s.diagnosisSvc = s.newDiagnosisService()
+	}
+	return s.diagnosisSvc
+}
+
+// newDiagnosisService must only be called while constructing the server or
+// while s.mu is held.
+func (s *Server) newDiagnosisService() *DiagnosisService {
+	return NewDiagnosisService(
+		s.diagnoses,
+		newMySQLDiagnosisRepository(s.mysqlDB),
+		DiagnosisProjectorFunc(s.projectDiagnosis),
+	)
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, req *http.Request) {
@@ -190,15 +224,23 @@ func (s *Server) handleChat(w http.ResponseWriter, req *http.Request) {
 	}
 
 	var chatReq ChatRequest
-	if err := json.NewDecoder(req.Body).Decode(&chatReq); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
-		return 
+	if !decodeJSON(w, req, &chatReq) {
+		return
 	}
 
 	if chatReq.Message == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "message is required"})
+		return
+	}
+	if s.app == nil || s.app.QueryEngine == nil || !s.app.QueryEngine.Available() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":      "provider_unavailable",
+				"message":   "No language model provider is available",
+				"retryable": true,
+			},
+		})
 		return
 	}
 
@@ -207,7 +249,11 @@ func (s *Server) handleChat(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 
 	ctx, cancel := context.WithCancel(req.Context())
-	defer cancel()
+	var heartbeatWG sync.WaitGroup
+	defer func() {
+		cancel()
+		heartbeatWG.Wait()
+	}()
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -215,64 +261,88 @@ func (s *Server) handleChat(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	var writerMu sync.Mutex
+	writeSSE := func(payload string) {
+		writerMu.Lock()
+		defer writerMu.Unlock()
+		fmt.Fprint(w, payload)
+		flusher.Flush()
+	}
+
 	send := func(event ChatEvent) {
 		data, _ := json.Marshal(event)
-		fmt.Fprintf(w, "data: %s\n\n", string(data))
-		flusher.Flush()
+		writeSSE(fmt.Sprintf("data: %s\n\n", data))
 	}
 
 	heartbeat := time.NewTicker(HeartbeatInterval)
 	defer heartbeat.Stop()
 
+	heartbeatWG.Add(1)
 	go func() {
+		defer heartbeatWG.Done()
 		for {
 			select {
 			case <-heartbeat.C:
-				fmt.Fprintf(w, ": ping\n\n")
-				flusher.Flush()
+				writeSSE(": ping\n\n")
 			case <-ctx.Done():
 				return
 			}
 		}
 	}()
 
-	s.mu.Lock()
+	sendProgress := func(stage string, detail map[string]interface{}) {
+		evt := map[string]interface{}{"type": "progress", "stage": stage}
+		for k, v := range detail {
+			evt[k] = v
+		}
+		data, _ := json.Marshal(evt)
+		writeSSE(fmt.Sprintf("data: %s\n\n", data))
+	}
+
 	userID := userIDFromContext(req.Context())
-	appInst := app.CreateApp(&app.AppOptions{
+	var sessionID string
+	appInst := s.app.NewRequest(&app.AppOptions{
 		Model:           chatReq.Model,
-		DB:              s.mysqlDB,
-		SessionManager:  s.app.SessionManager,
-		MemoryStore:     s.app.MemoryStore,
 		OnTextDelta:     func(text string) { send(ChatEvent{Type: "text_delta", Content: text}) },
 		OnThinkingDelta: func(text string) { send(ChatEvent{Type: "thinking_delta", Content: text}) },
-		OnToolCall:      func(name string, input map[string]interface{}) { send(ChatEvent{Type: "tool_call", Name: name, Input: input}) },
-		OnToolResult:    func(name string, result string) { send(ChatEvent{Type: "tool_result", Name: name, Result: result}) },
+		OnToolCall: func(name string, input map[string]interface{}) {
+			send(ChatEvent{Type: "tool_call", Name: name, Input: input})
+		},
+		OnToolResult: func(name string, result string) { send(ChatEvent{Type: "tool_result", Name: name, Result: result}) },
 		OnDiagnosisRecord: func(sessionID, dimension string, score int, question string) {
 			s.recordDiagnosis(userID, sessionID, dimension, score, question)
 		},
 		OnInterviewQuestions: func(questions []string) {
-			s.saveInterviewQuestions(questions)
+			s.saveInterviewQuestions(sessionID, questions)
 		},
+		OnRetry: func(attempt int, maxRetries int, reason string) {
+			sendProgress("retrying", map[string]interface{}{
+				"attempt":    attempt,
+				"maxRetries": maxRetries,
+				"reason":     reason,
+				"step":       "model_retrying",
+			})
+		},
+		OnProgress: sendProgress,
 	})
-	s.mu.Unlock()
 
-	var sessionID string
 	if chatReq.SessionID != "" {
-		_, err := appInst.SessionManager.Get(chatReq.SessionID)
-		if err == nil {
+		if s.canAccessSession(req, chatReq.SessionID, userID) {
 			sessionID = chatReq.SessionID
+		} else {
+			send(ChatEvent{Type: "error", Error: "session access denied"})
+			return
 		}
 	}
 	if sessionID == "" {
 		if c, err := req.Cookie("offerpilot_sid"); err == nil && c.Value != "" {
-			_, err := appInst.SessionManager.Get(c.Value)
-			if err == nil {
+			if s.canAccessSession(req, c.Value, userID) {
 				sessionID = c.Value
 			}
 		}
 	}
 	if sessionID == "" {
-		newSession := appInst.SessionManager.Create("")
+		newSession := appInst.SessionManager.Create(userID)
 		sessionID = newSession.ID
 	}
 
@@ -307,8 +377,7 @@ func (s *Server) handleChat(w http.ResponseWriter, req *http.Request) {
 		},
 	})
 
-	fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
+	writeSSE("data: [DONE]\n\n")
 }
 
 // handleSessionNew 创建全新的对话会话（新会话功能入口）。
@@ -328,7 +397,7 @@ func (s *Server) handleSessionNew(w http.ResponseWriter, req *http.Request) {
 	userID := userIDFromContext(req.Context())
 
 	// 1. 若有旧会话，生成摘要并写入长期记忆
-	if c, err := req.Cookie("offerpilot_sid"); err == nil && c.Value != "" {
+	if c, err := req.Cookie("offerpilot_sid"); err == nil && c.Value != "" && s.canAccessSession(req, c.Value, userID) {
 		if oldSess, err := s.app.SessionManager.Get(c.Value); err == nil && oldSess != nil && len(oldSess.Messages) > 0 {
 			s.summarizeAndRemember(userID, c.Value, oldSess)
 			// 标记旧会话为 completed
@@ -458,6 +527,14 @@ func (s *Server) handleSessions(w http.ResponseWriter, req *http.Request) {
 
 	userID := userIDFromContext(req.Context())
 	sessions := s.app.SessionManager.ListByUserID(userID)
+	if userID == "" {
+		sessions = nil
+		if c, err := req.Cookie("offerpilot_sid"); err == nil && s.canAccessSession(req, c.Value, "") {
+			if sess, err := s.app.SessionManager.Get(c.Value); err == nil {
+				sessions = []*session.Session{sess}
+			}
+		}
+	}
 
 	type sessionItem struct {
 		ID        string `json:"id"`
@@ -500,18 +577,18 @@ func (s *Server) handleSession(w http.ResponseWriter, req *http.Request) {
 
 	switch req.Method {
 	case http.MethodPost:
+		userID := userIDFromContext(req.Context())
 		// Try to reuse existing session from cookie first
 		var sessionID string
 		var existingMsgs []*schema.Message
 		if c, err := req.Cookie("offerpilot_sid"); err == nil && c.Value != "" {
-			if sess, err := s.app.SessionManager.Get(c.Value); err == nil {
+			if s.canAccessSession(req, c.Value, userID) {
 				sessionID = c.Value
 				existingMsgs, _ = s.app.SessionManager.GetMessages(c.Value)
-				_ = sess
 			}
 		}
 		if sessionID == "" {
-			session := s.app.SessionManager.Create("")
+			session := s.app.SessionManager.Create(userID)
 			sessionID = session.ID
 		}
 		fmt.Printf("[DEBUG] handleSession POST sid=%s\n", sessionID)
@@ -546,6 +623,11 @@ func (s *Server) handleSession(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, "id required", http.StatusBadRequest)
 			return
 		}
+		userID := userIDFromContext(req.Context())
+		if !s.canAccessSession(req, sid, userID) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
 		sess, err := s.app.SessionManager.Get(sid)
 		if err != nil {
 			http.Error(w, "not found", http.StatusNotFound)
@@ -575,6 +657,10 @@ func (s *Server) handleSession(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		userID := userIDFromContext(req.Context())
+		if !s.canAccessSession(req, sid, userID) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
 		if err := s.app.SessionManager.Delete(sid, userID); err != nil {
 			http.Error(w, err.Error(), http.StatusForbidden)
 			return
@@ -584,378 +670,44 @@ func (s *Server) handleSession(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-func (s *Server) handleHealth(w http.ResponseWriter, req *http.Request) {
-	s.cors(w)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-}
-
-func (s *Server) handleTranscribe(w http.ResponseWriter, req *http.Request) {
-	s.cors(w)
-
-	if req.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	if req.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if !s.validateAuth(req) {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
-		return
-	}
-
-	audio, err := io.ReadAll(req.Body)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to read audio"})
-		return
-	}
-
-	if len(audio) == 0 {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "audio body is required"})
-		return
-	}
-
-	result, err := realtime.TranscribeAudio(realtime.TranscribeAudioInput{
-		Audio:       audio,
-		FileName:    req.Header.Get("X-File-Name"),
-		ContentType: req.Header.Get("Content-Type"),
-	})
-	if err != nil {
-		logger.DefaultLogger.Error("transcribe failed", map[string]interface{}{"error": err.Error()})
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(result)
-}
-
-func (s *Server) handleTTS(w http.ResponseWriter, req *http.Request) {
-	s.cors(w)
-
-	if req.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	if req.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if !s.validateAuth(req) {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
-		return
-	}
-
-	var ttsReq struct {
-		Text   string `json:"text"`
-		Voice  string `json:"voice"`
-		Format string `json:"format"`
-	}
-
-	if err := json.NewDecoder(req.Body).Decode(&ttsReq); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
-		return
-	}
-
-	if ttsReq.Text == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "text is required"})
-		return
-	}
-
-	result, err := realtime.SynthesizeSpeech(realtime.SynthesizeSpeechInput{
-		Text:   ttsReq.Text,
-		Voice:  ttsReq.Voice,
-		Format: ttsReq.Format,
-	})
-	if err != nil {
-		logger.DefaultLogger.Error("tts failed", map[string]interface{}{"error": err.Error()})
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-
-	w.Header().Set("Content-Type", result.ContentType)
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusOK)
-	w.Write(result.Audio)
-}
-
-func (s *Server) handleConfig(w http.ResponseWriter, req *http.Request) {
-	s.cors(w)
-
-	if req.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	if !s.validateAuth(req) {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
-		return
-	}
-
-	if req.Method == http.MethodGet {
-		s.handleConfigGet(w)
-		return
-	}
-
-	if req.Method == http.MethodPost {
-		s.handleConfigPost(w, req)
-		return
-	}
-
-	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-}
-
-func (s *Server) handleConfigGet(w http.ResponseWriter) {
-	env := loadEnv()
-	for _, v := range os.Environ() {
-		parts := strings.SplitN(v, "=", 2)
-		if len(parts) == 2 && env[parts[0]] == "" {
-			env[parts[0]] = parts[1]
-		}
-	}
-
-	type ModelEntry struct {
-		Name            string `json:"name"`
-		Provider        string `json:"provider"`
-		Model           string `json:"model"`
-		BaseURL         string `json:"base_url"`
-		EnvKey          string `json:"env_key"`
-		ModelEnvKey     *string `json:"model_env_key"`
-		BaseURLEnvKey   *string `json:"base_url_env_key"`
-		Available       bool   `json:"available"`
-	}
-
-	textModels := []ModelEntry{
-		{Name: "Claude", Provider: "anthropic", Model: env["ANTHROPIC_MODEL"], EnvKey: "ANTHROPIC_API_KEY", Available: env["ANTHROPIC_API_KEY"] != "" && env["ANTHROPIC_API_KEY"] != "sk-ant-..."},
-		{Name: "OpenAI", Provider: "openai", Model: env["OPENAI_MODEL"], EnvKey: "OPENAI_API_KEY", Available: env["OPENAI_API_KEY"] != "" && env["OPENAI_API_KEY"] != "sk-..."},
-		{Name: "DeepSeek", Provider: "deepseek", Model: env["DEEPSEEK_MODEL"], EnvKey: "DEEPSEEK_API_KEY", Available: env["DEEPSEEK_API_KEY"] != ""},
-	}
-
-	ttsModels := []ModelEntry{
-		{Name: "Mimo TTS", Provider: "mimo", Model: env["MIMO_TTS_MODEL"], EnvKey: "MIMO_API_KEY", Available: env["MIMO_API_KEY"] != ""},
-		{Name: "OpenAI TTS", Provider: "openai", Model: env["OPENAI_TTS_MODEL"], EnvKey: "OPENAI_API_KEY", Available: env["OPENAI_API_KEY"] != ""},
-	}
-
-	envVars := make(map[string]string)
-	for _, m := range textModels {
-		envVars[m.EnvKey] = env[m.EnvKey]
-	}
-	for _, m := range ttsModels {
-		envVars[m.EnvKey] = env[m.EnvKey]
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"text":       textModels,
-		"tts":        ttsModels,
-		"multimodal": []ModelEntry{},
-		"envVars":    envVars,
-	})
-}
-
-func (s *Server) handleConfigPost(w http.ResponseWriter, req *http.Request) {
-	var body struct {
-		EnvVars map[string]string `json:"envVars"`
-	}
-
-	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
-		return
-	}
-
-	if body.EnvVars == nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "envVars object is required"})
-		return
-	}
-
-	existing := loadEnv()
-	for k, v := range body.EnvVars {
-		existing[k] = v
-	}
-
-	lines := []string{
-		"# OfferPilot 模型配置 (由弹窗自动生成)",
-		"# 手动编辑也会保留",
-		"",
-	}
-
-	groups := []struct {
-		Label string
-		Keys  []string
-	}{
-		{Label: "文本模型", Keys: []string{"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL"}},
-		{Label: "TTS 语音合成", Keys: []string{"MIMO_API_KEY", "MIMO_BASE_URL", "MIMO_TTS_MODEL", "OPENAI_TTS_MODEL"}},
-		{Label: "语音识别", Keys: []string{"MIMO_ASR_MODEL", "OPENAI_ASR_MODEL"}},
-	}
-
-	written := make(map[string]bool)
-	for _, group := range groups {
-		lines = append(lines, "# --- "+group.Label+" ---")
-		for _, key := range group.Keys {
-			if existing[key] != "" {
-				lines = append(lines, key+"="+existing[key])
-				written[key] = true
-			}
-		}
-		lines = append(lines, "")
-	}
-
-	for k, v := range existing {
-		if !written[k] && v != "" {
-			lines = append(lines, k+"="+v)
-		}
-	}
-
-	envPath := filepath.Join(os.Getenv("PROJECT_ROOT"), ".env")
-	if envPath == ".env" {
-		envPath = filepath.Join("..", ".env")
-	}
-
-	if err := os.WriteFile(envPath, []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
-}
-
-func loadEnv() map[string]string {
-	env := make(map[string]string)
-	envPath := filepath.Join(os.Getenv("PROJECT_ROOT"), ".env")
-	if envPath == ".env" {
-		envPath = filepath.Join("..", ".env")
-	}
-
-	data, err := os.ReadFile(envPath)
-	if err != nil {
-		return env
-	}
-
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		eqIdx := strings.Index(line, "=")
-		if eqIdx == -1 {
-			continue
-		}
-		key := strings.TrimSpace(line[:eqIdx])
-		val := strings.TrimSpace(line[eqIdx+1:])
-		env[key] = val
-	}
-
-	return env
-}
-
-type DiagnosisRecord struct {
-	ID        string `json:"id"`
-	Timestamp int64  `json:"timestamp"`
-	Dimension string `json:"dimension"`
-	Score     int    `json:"score"`
-	Question  string `json:"question"`
-	SessionID string `json:"sessionId"`
-	UserID    string `json:"userId"`
-}
-
-type SM2State struct {
-	Dimension   string
-	EaseFactor  float64
-	Interval    int
-	Repetitions int
-	NextReview  int64
-}
-
-var (
-	diagnosisRecords []DiagnosisRecord
-	sm2States        = make(map[string]SM2State)
-	diagnosisMu      sync.Mutex
-)
-
-// recordDiagnosis 写内存 + MySQL 并更新 SM-2 状态。
+// recordDiagnosis delegates diagnosis orchestration while preserving the
+// non-blocking behavior expected by chat and interview flows.
 func (s *Server) recordDiagnosis(userID, sessionID, dimension string, score int, question string) {
-	diagnosisMu.Lock()
-	defer diagnosisMu.Unlock()
-
-	score = max(1, min(10, score))
-
-	record := DiagnosisRecord{
-		ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
-		Timestamp: time.Now().UnixMilli(),
-		Dimension: dimension,
-		Score:     score,
-		Question:  question,
-		SessionID: sessionID,
-		UserID:    userID,
+	if _, err := s.diagnosisService().Record(
+		context.Background(), userID, sessionID, dimension, score, question,
+	); err != nil {
+		logger.DefaultLogger.Warn("record diagnosis failed", map[string]interface{}{"error": err.Error()})
 	}
-	diagnosisRecords = append(diagnosisRecords, record)
+}
 
-	applySM2(dimension, score)
-
-	// MySQL 落库（失败不阻塞，仅告警）
-	if s.mysqlDB != nil {
-		if _, err := s.mysqlDB.Exec(
-			`INSERT INTO diagnoses (user_id, session_id, dimension, score, question, timestamp) VALUES (?,?,?,?,?,?)`,
-			userID, sessionID, dimension, score, question, record.Timestamp,
-		); err != nil {
-			logger.DefaultLogger.Warn("insert diagnosis failed", map[string]interface{}{"error": err.Error()})
-		}
-	}
-
-	// 触发点①：规则化写入记忆（弱项/强项）
-	s.upsertDiagnosisMemory(userID, sessionID, dimension, score)
-
-	// 更新第一层活性画像（内存）
-	s.updateActiveProfile(dimension, question)
-
-	// 更新第二层知识点（MySQL + 缓存）
-	s.saveKnowledgePoint(userID, dimension, score)
+func (s *Server) projectDiagnosis(_ context.Context, record DiagnosisRecord) error {
+	s.upsertDiagnosisMemory(record.UserID, record.SessionID, record.Dimension, record.Score)
+	s.updateActiveProfile(record.SessionID, record.Dimension, record.Question)
+	s.saveKnowledgePoint(record.UserID, record.Dimension, record.Score)
+	return nil
 }
 
 // saveInterviewQuestions 把 mock_interview 生成的题目序列存到活性画像。
-func (s *Server) saveInterviewQuestions(questions []string) {
+func (s *Server) saveInterviewQuestions(sessionID string, questions []string) {
 	if s.app == nil || s.app.MemoryStore == nil {
 		return
 	}
-	ap := s.app.MemoryStore.GetActiveProfile()
+	ap := s.app.MemoryStore.GetActiveProfile(sessionID)
 	ap.Questions = questions
 	ap.QuestionIndex = 0 // 重置题号，准备从第 1 题开始
-	s.app.MemoryStore.UpdateActiveProfile(*ap)
+	s.app.MemoryStore.UpdateActiveProfile(sessionID, *ap)
 }
 
 // updateActiveProfile 更新第一层活性画像（面试状态机）。
-func (s *Server) updateActiveProfile(dimension, question string) {
+func (s *Server) updateActiveProfile(sessionID, dimension, question string) {
 	if s.app == nil || s.app.MemoryStore == nil {
 		return
 	}
-	ap := s.app.MemoryStore.GetActiveProfile()
+	ap := s.app.MemoryStore.GetActiveProfile(sessionID)
 	ap.CurrentTopic = dimension
 	ap.CurrentQuestion = question
 	ap.QuestionIndex++
-	s.app.MemoryStore.UpdateActiveProfile(*ap)
+	s.app.MemoryStore.UpdateActiveProfile(sessionID, *ap)
 }
 
 // saveKnowledgePoint 更新第二层知识点掌握情况（MySQL + 内存缓存）。
@@ -965,7 +717,7 @@ func (s *Server) saveKnowledgePoint(userID, pointName string, score int) {
 
 	// 更新内存缓存
 	if s.app != nil && s.app.MemoryStore != nil {
-		points := s.app.MemoryStore.GetKnowledgePoints()
+		points := s.app.MemoryStore.GetKnowledgePoints(userID)
 		found := false
 		for i := range points {
 			if points[i].UserID == userID && points[i].PointName == pointName {
@@ -981,7 +733,7 @@ func (s *Server) saveKnowledgePoint(userID, pointName string, score int) {
 				UserID: userID, PointName: pointName, Score: score, Mastered: mastered, UpdatedAt: now,
 			})
 		}
-		s.app.MemoryStore.SetKnowledgePoints(points)
+		s.app.MemoryStore.SetKnowledgePoints(userID, points)
 	}
 
 	// 写 MySQL
@@ -1018,7 +770,7 @@ func (s *Server) loadProfile(userID string) {
 			}
 		}
 		rows.Close()
-		ms.SetKnowledgePoints(points)
+		ms.SetKnowledgePoints(userID, points)
 	}
 
 	// 加载求职信息
@@ -1033,7 +785,7 @@ func (s *Server) loadProfile(userID string) {
 		p.JobDirection = dir.String
 		p.TargetPosition = pos.String
 		p.CurrentSituation = sit.String
-		ms.SetProfile(&p)
+		ms.SetProfile(userID, &p)
 	}
 
 	// 加载 MemoryEntry（weakness/strength/face/preference/context）到内存缓存
@@ -1093,7 +845,11 @@ func (s *Server) upsertDiagnosisMemory(userID, sessionID, dimension string, scor
 // upsertMemory 按 user + type + 维度去重后写入一条记忆。
 func (s *Server) upsertMemory(userID, sessionID string, mtype memory.MemoryType, dimension string, score int) {
 	ms := s.app.MemoryStore
-	existing := ms.Query(memory.MemoryQuery{UserID: userID, Type: mtype})
+	query := memory.MemoryQuery{UserID: userID, Type: mtype}
+	if userID == "" {
+		query.SessionID = sessionID
+	}
+	existing := ms.Query(query)
 	for _, e := range existing {
 		if strings.Contains(e.Content, dimension) {
 			return // 已有同维度记忆，跳过
@@ -1108,68 +864,15 @@ func (s *Server) upsertMemory(userID, sessionID string, mtype memory.MemoryType,
 	})
 }
 
-// applySM2 更新指定维度的 SM-2 间隔复习状态（内存态，需持 diagnosisMu 锁）。
-func applySM2(dimension string, score int) {
-	existing, ok := sm2States[dimension]
-	if !ok {
-		existing = SM2State{
-			Dimension:   dimension,
-			EaseFactor:  2.5,
-			Interval:    1,
-			Repetitions: 0,
-			NextReview:  time.Now().UnixMilli(),
-		}
-	}
-
-	quality := max(0, min(5, (score*5)/10))
-	var interval int
-	if quality >= 3 {
-		if existing.Repetitions == 0 {
-			interval = 1
-		} else if existing.Repetitions == 1 {
-			interval = 3
-		} else {
-			interval = int(float64(existing.Interval) * existing.EaseFactor)
-		}
-		existing.Repetitions++
-	} else {
-		existing.Repetitions = 0
-		interval = 1
-	}
-
-	existing.EaseFactor = max(1.3, existing.EaseFactor+(0.1-float64(5-quality)*(0.08+float64(5-quality)*0.02)))
-	existing.Interval = interval
-	existing.NextReview = time.Now().UnixMilli() + int64(interval)*24*60*60*1000
-	sm2States[dimension] = existing
-}
-
-// loadDiagnoses 从 MySQL 加载历史诊断记录到内存并重建 SM-2 状态。
+// loadDiagnoses loads persisted records through the diagnosis service.
 func (s *Server) loadDiagnoses() {
-	if s.mysqlDB == nil {
-		return
-	}
-
-	rows, err := s.mysqlDB.Query(
-		`SELECT user_id, session_id, dimension, score, question, timestamp FROM diagnoses ORDER BY timestamp ASC`,
-	)
+	count, err := s.diagnosisService().Load(context.Background())
 	if err != nil {
 		logger.DefaultLogger.Warn("load diagnoses failed", map[string]interface{}{"error": err.Error()})
 		return
 	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var r DiagnosisRecord
-		if err := rows.Scan(&r.UserID, &r.SessionID, &r.Dimension, &r.Score, &r.Question, &r.Timestamp); err != nil {
-			continue
-		}
-		r.ID = fmt.Sprintf("%d", r.Timestamp)
-		diagnosisRecords = append(diagnosisRecords, r)
-		applySM2(r.Dimension, r.Score)
-	}
-
-	if len(diagnosisRecords) > 0 {
-		logger.DefaultLogger.Info("diagnoses loaded from MySQL", map[string]interface{}{"count": len(diagnosisRecords)})
+	if count > 0 {
+		logger.DefaultLogger.Info("diagnoses loaded from MySQL", map[string]interface{}{"count": count})
 	}
 }
 
@@ -1188,7 +891,7 @@ func (s *Server) handleDiagnosis(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if req.Method == http.MethodGet {
-		s.handleDiagnosisGet(w)
+		s.handleDiagnosisGet(w, req)
 		return
 	}
 
@@ -1200,9 +903,15 @@ func (s *Server) handleDiagnosis(w http.ResponseWriter, req *http.Request) {
 	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 }
 
-func (s *Server) handleDiagnosisGet(w http.ResponseWriter) {
-	diagnosisMu.Lock()
-	defer diagnosisMu.Unlock()
+func (s *Server) handleDiagnosisGet(w http.ResponseWriter, req *http.Request) {
+	userID := userIDFromContext(req.Context())
+	sessionID := ""
+	if userID == "" {
+		if cookie, err := req.Cookie("offerpilot_sid"); err == nil {
+			sessionID = cookie.Value
+		}
+	}
+	records, reviewStates := s.diagnosisState().Snapshot(userID, sessionID)
 
 	dimensions := []string{"architecture", "engineering", "model", "rag", "multi-agent", "evaluation", "full-stack"}
 
@@ -1216,7 +925,7 @@ func (s *Server) handleDiagnosisGet(w http.ResponseWriter) {
 	for _, dim := range dimensions {
 		var sum int
 		var count int
-		for _, r := range diagnosisRecords {
+		for _, r := range records {
 			if r.Dimension == dim {
 				sum += r.Score
 				count++
@@ -1229,11 +938,11 @@ func (s *Server) handleDiagnosisGet(w http.ResponseWriter) {
 		dimensionScores = append(dimensionScores, DimScore{Dimension: dim, Score: avg, Count: count})
 	}
 
-	totalAnswered := len(diagnosisRecords)
+	totalAnswered := len(records)
 	avgScore := 0
 	if totalAnswered > 0 {
 		sum := 0
-		for _, r := range diagnosisRecords {
+		for _, r := range records {
 			sum += r.Score
 		}
 		avgScore = sum / totalAnswered
@@ -1247,24 +956,24 @@ func (s *Server) handleDiagnosisGet(w http.ResponseWriter) {
 	}
 
 	recent := make([]DiagnosisRecord, 0)
-	if len(diagnosisRecords) > 0 {
-		start := len(diagnosisRecords) - 10
+	if len(records) > 0 {
+		start := len(records) - 10
 		if start < 0 {
 			start = 0
 		}
-		recent = diagnosisRecords[start:]
+		recent = records[start:]
 	}
 
 	type ReviewPriority struct {
-		Dimension      string  `json:"dimension"`
-		Urgency        int     `json:"urgency"`
+		Dimension       string `json:"dimension"`
+		Urgency         int    `json:"urgency"`
 		DaysUntilReview *int   `json:"daysUntilReview"`
 	}
 
 	reviewPriority := make([]ReviewPriority, 0)
 	now := time.Now().UnixMilli()
 	for _, dim := range dimensions {
-		state, ok := sm2States[dim]
+		state, ok := reviewStates[dim]
 		if !ok {
 			continue
 		}
@@ -1277,8 +986,8 @@ func (s *Server) handleDiagnosisGet(w http.ResponseWriter) {
 		}
 		if urgency > 0 || daysUntil >= 0 {
 			reviewPriority = append(reviewPriority, ReviewPriority{
-				Dimension:      dim,
-				Urgency:        urgency,
+				Dimension:       dim,
+				Urgency:         urgency,
 				DaysUntilReview: &daysUntil,
 			})
 		}
@@ -1304,8 +1013,7 @@ func (s *Server) handleDiagnosisPost(w http.ResponseWriter, req *http.Request) {
 		SessionID string `json:"sessionId"`
 	}
 
-	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid JSON"})
+	if !decodeJSON(w, req, &body) {
 		return
 	}
 
@@ -1315,451 +1023,18 @@ func (s *Server) handleDiagnosisPost(w http.ResponseWriter, req *http.Request) {
 	}
 
 	userID := userIDFromContext(req.Context())
+	if body.SessionID == "" {
+		if cookie, err := req.Cookie("offerpilot_sid"); err == nil {
+			body.SessionID = cookie.Value
+		}
+	}
+	if !s.canAccessSession(req, body.SessionID, userID) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "session access denied"})
+		return
+	}
 	s.recordDiagnosis(userID, body.SessionID, body.Dimension, body.Score, body.Question)
 
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
-type InterviewSession struct {
-	ID               string
-	Questions        []string
-	CurrentIndex     int
-	State            string
-	Transcript       []map[string]interface{}
-	Defects          []map[string]interface{}
-	QuestionStartTime int64
-}
-
-var (
-	interviewSessions = make(map[string]*InterviewSession)
-	interviewMu       sync.Mutex
-)
-
-var defaultQuestions = []string{
-	"请介绍一下你在 Agent 方向的工作经历",
-	"什么是 ReAct 模式？工程实现中需要注意什么？",
-	"如何设计一个支持多 Provider 的 LLM 调用层？",
-	"RAG 系统中 Chunk 策略有哪些选择？各自适合什么场景？",
-	"说一个你优化系统性能的具体案例",
-}
-
-func (s *Server) handleInterview(w http.ResponseWriter, req *http.Request) {
-	s.cors(w)
-
-	if req.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	if req.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if !s.validateAuth(req) {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
-		return
-	}
-
-	var body struct {
-		Action    string   `json:"action"`
-		SessionID string   `json:"sessionId"`
-		Answer    string   `json:"answer"`
-		Questions []string `json:"questions"`
-	}
-
-	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
-		return
-	}
-
-	interviewMu.Lock()
-	defer interviewMu.Unlock()
-
-	if body.Action == "start" {
-		id := fmt.Sprintf("%d", time.Now().UnixNano())
-		qs := body.Questions
-		if len(qs) == 0 {
-			qs = defaultQuestions
-		}
-
-		session := &InterviewSession{
-			ID:               id,
-			Questions:        qs,
-			CurrentIndex:     0,
-			State:            "questioning",
-			Transcript:       make([]map[string]interface{}, 0),
-			Defects:          make([]map[string]interface{}, 0),
-			QuestionStartTime: time.Now().UnixMilli(),
-		}
-
-		firstQuestion := qs[0]
-		session.Transcript = append(session.Transcript, map[string]interface{}{
-			"speaker":   "interviewer",
-			"text":      firstQuestion,
-			"timestamp": time.Now().UnixMilli(),
-		})
-		interviewSessions[id] = session
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"sessionId": id,
-			"question":  firstQuestion,
-			"progress": map[string]int{"current": 1, "total": len(qs)},
-		})
-		return
-	}
-
-	session, ok := interviewSessions[body.SessionID]
-	if !ok {
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Session not found"})
-		return
-	}
-
-	if body.Action == "answer" {
-		if body.Answer == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"error": "answer is required"})
-			return
-		}
-
-		elapsed := time.Now().UnixMilli() - session.QuestionStartTime
-		session.Transcript = append(session.Transcript, map[string]interface{}{
-			"speaker":   "candidate",
-			"text":      body.Answer,
-			"timestamp": time.Now().UnixMilli(),
-		})
-
-		defects := analyzeDefects(session.Questions[session.CurrentIndex], body.Answer, elapsed)
-		session.Defects = append(session.Defects, defects...)
-		session.CurrentIndex++
-
-		hasNext := session.CurrentIndex < len(session.Questions)
-		session.State = "answering"
-		if !hasNext {
-			session.State = "idle"
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"defects":  defects,
-			"summary":  buildSummary(defects),
-			"hasNext":  hasNext,
-			"progress": map[string]int{"current": session.CurrentIndex, "total": len(session.Questions)},
-		})
-		return
-	}
-
-	if body.Action == "next" {
-		if session.CurrentIndex >= len(session.Questions) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			json.NewEncoder(w).Encode(map[string]interface{}{"error": "No more questions", "done": true})
-			return
-		}
-
-		question := session.Questions[session.CurrentIndex]
-		session.State = "questioning"
-		session.QuestionStartTime = time.Now().UnixMilli()
-		session.Transcript = append(session.Transcript, map[string]interface{}{
-			"speaker":   "interviewer",
-			"text":      question,
-			"timestamp": time.Now().UnixMilli(),
-		})
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"question": question,
-			"progress": map[string]int{"current": session.CurrentIndex + 1, "total": len(session.Questions)},
-		})
-		return
-	}
-
-	if body.Action == "report" {
-		defects := session.Defects
-		bySeverity := map[string]int{"critical": 0, "moderate": 0, "minor": 0}
-		for _, d := range defects {
-			sev := d["severity"].(string)
-			bySeverity[sev]++
-		}
-
-		typeCounts := make(map[string]int)
-		for _, d := range defects {
-			typ := d["type"].(string)
-			typeCounts[typ]++
-		}
-
-		type IssueCount struct {
-			Type  string `json:"type"`
-			Count int    `json:"count"`
-		}
-
-		topIssues := make([]IssueCount, 0)
-		for typ, count := range typeCounts {
-			topIssues = append(topIssues, IssueCount{Type: typ, Count: count})
-		}
-
-		maxDefects := session.CurrentIndex * 4
-		overallScore := max(1, 10-(len(defects)/max(maxDefects, 1))*7)
-
-		delete(interviewSessions, session.ID)
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"totalQuestions": session.CurrentIndex,
-			"totalDefects":   len(defects),
-			"bySeverity":     bySeverity,
-			"topIssues":      topIssues,
-			"overallScore":   overallScore,
-			"transcript":     session.Transcript,
-		})
-		return
-	}
-
-	w.WriteHeader(http.StatusBadRequest)
-	json.NewEncoder(w).Encode(map[string]string{"error": "Invalid action"})
-}
-
-func analyzeDefects(question, answer string, elapsedMs int64) []map[string]interface{} {
-	defects := make([]map[string]interface{}, 0)
-	idCounter := 0
-
-	mkId := func() string {
-		idCounter++
-		return fmt.Sprintf("d%d-%d", time.Now().UnixMilli(), idCounter)
-	}
-
-	if len(answer) < 50 {
-		defects = append(defects, map[string]interface{}{
-			"id":          mkId(),
-			"type":        "too_short",
-			"severity":    "critical",
-			"description": "回答过于简短，缺乏有效信息",
-			"suggestion":  "至少展开 2-3 个要点，每个要点一句话",
-		})
-	}
-
-	if len(answer) > 100 && !regexp.MustCompile(`[1-9一二三四五六七八九十][.、)）]`).MatchString(answer) && !strings.Contains(answer, "首先") && !strings.Contains(answer, "其次") {
-		defects = append(defects, map[string]interface{}{
-			"id":          mkId(),
-			"type":        "no_structure",
-			"severity":    "moderate",
-			"description": "回答缺乏结构，一段到底",
-			"suggestion":  "用\"第一…第二…第三…\"或\"首先…其次…最后…\"组织",
-		})
-	}
-
-	if len(answer) > 80 && !strings.Contains(answer, "例如") && !strings.Contains(answer, "比如") && !strings.Contains(answer, "实际") && !strings.Contains(answer, "项目") {
-		defects = append(defects, map[string]interface{}{
-			"id":          mkId(),
-			"type":        "missing_example",
-			"severity":    "moderate",
-			"description": "缺少具体案例支撑",
-			"suggestion":  "加一句\"比如在我之前的项目中…\"增强说服力",
-		})
-	}
-
-	vagueCount := len(regexp.MustCompile(`可能|大概|好像|一些|某些|差不多`).FindAllString(answer, -1))
-	if vagueCount >= 3 {
-		defects = append(defects, map[string]interface{}{
-			"id":          mkId(),
-			"type":        "too_vague",
-			"severity":    "moderate",
-			"description": fmt.Sprintf("模糊表述过多（%d 处）", vagueCount),
-			"suggestion":  "用具体数字和明确说法替换\"大概\"\"可能\"",
-		})
-	}
-
-	if len(answer) > 150 && !strings.Contains(answer, "因为") && !strings.Contains(answer, "原因") && !strings.Contains(answer, "本质") {
-		defects = append(defects, map[string]interface{}{
-			"id":          mkId(),
-			"type":        "no_depth",
-			"severity":    "minor",
-			"description": "停留在表面描述，缺少原理分析",
-			"suggestion":  "补充一句\"之所以这样做是因为…\"展示深度理解",
-		})
-	}
-
-	fillerCount := len(regexp.MustCompile(`那个|就是说|嗯|额|然后就|对吧`).FindAllString(answer, -1))
-	if fillerCount >= 3 {
-		defects = append(defects, map[string]interface{}{
-			"id":          mkId(),
-			"type":        "filler_words",
-			"severity":    "minor",
-			"description": fmt.Sprintf("口头禅过多（%d 处）", fillerCount),
-			"suggestion":  "放慢语速，用短暂停顿替代\"嗯\"\"那个\"",
-		})
-	}
-
-	if elapsedMs > 15000 && len(answer) < 100 {
-		defects = append(defects, map[string]interface{}{
-			"id":          mkId(),
-			"type":        "hesitation",
-			"severity":    "minor",
-			"description": "思考时间过长",
-			"suggestion":  "先说\"这个问题我从X角度来回答\"争取思考时间",
-		})
-	}
-
-	return defects
-}
-
-func buildSummary(defects []map[string]interface{}) string {
-	if len(defects) == 0 {
-		return "这道题回答不错，没有明显缺陷"
-	}
-	critical := 0
-	for _, d := range defects {
-		if d["severity"] == "critical" {
-			critical++
-		}
-	}
-	summary := fmt.Sprintf("发现 %d 个问题", len(defects))
-	if critical > 0 {
-		summary += fmt.Sprintf("（%d 个严重）", critical)
-	}
-	return summary
-}
-
-func (s *Server) handleMatch(w http.ResponseWriter, req *http.Request) {
-	s.cors(w)
-
-	if req.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	if req.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if !s.validateAuth(req) {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
-		return
-	}
-
-	var body struct {
-		JD     string `json:"jd"`
-		Resume string `json:"resume"`
-	}
-
-	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
-		return
-	}
-
-	if strings.TrimSpace(body.JD) == "" || strings.TrimSpace(body.Resume) == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "jd and resume are required"})
-		return
-	}
-
-	jdKeywords := tool.ExtractKeywords(body.JD)
-	resumeKeywords := tool.ExtractKeywords(body.Resume)
-
-	matched := make([]string, 0)
-	for _, kw := range jdKeywords {
-		found := false
-		for _, rk := range resumeKeywords {
-			if strings.Contains(rk, kw) || strings.Contains(kw, rk) {
-				found = true
-				break
-			}
-		}
-		if found {
-			matched = append(matched, kw)
-		}
-	}
-
-	missing := make([]string, 0)
-	for _, kw := range jdKeywords {
-		found := false
-		for _, rk := range resumeKeywords {
-			if strings.Contains(rk, kw) || strings.Contains(kw, rk) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			missing = append(missing, kw)
-		}
-	}
-
-	score := 50
-	if len(jdKeywords) > 0 {
-		score = (len(matched) * 100) / len(jdKeywords)
-	}
-
-	level := tool.DetectLevel(body.JD)
-	focus := tool.DetectFocus(body.JD)
-	suggestions := tool.GenerateSuggestions(missing, body.Resume)
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"score":       score,
-		"matched":     matched,
-		"missing":     missing,
-		"suggestions": suggestions,
-		"level":       level,
-		"focus":       focus,
-	})
-}
-
-func (s *Server) handleResume(w http.ResponseWriter, req *http.Request) {
-	s.cors(w)
-
-	if req.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	if req.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if !s.validateAuth(req) {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
-		return
-	}
-
-	var body struct {
-		Content string `json:"content"`
-	}
-
-	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
-		return
-	}
-
-	if strings.TrimSpace(body.Content) == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "content is required"})
-		return
-	}
-
-	sections := tool.SplitSections(body.Content)
-	diagnosis := make([]map[string]interface{}, 0)
-	for _, section := range sections {
-		diagnosis = append(diagnosis, tool.AnalyzeSection(section))
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{"diagnosis": diagnosis})
 }
 
 func (s *Server) handleParsePDF(w http.ResponseWriter, req *http.Request) {
@@ -1793,6 +1068,10 @@ func (s *Server) handleParsePDF(w http.ResponseWriter, req *http.Request) {
 	}()
 
 	if err := req.ParseMultipartForm(10 << 20); err != nil {
+		if isRequestTooLarge(err) {
+			writeAPIError(w, http.StatusRequestEntityTooLarge, "request_too_large", "Request body is too large", false)
+			return
+		}
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to parse form"})
 		return
@@ -2010,25 +1289,25 @@ func (s *Server) handleParseURL(w http.ResponseWriter, req *http.Request) {
 		URL string `json:"url"`
 	}
 
-	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+	if !decodeJSON(w, req, &body) {
 		return
 	}
 
-	url := strings.TrimSpace(body.URL)
-	if url == "" {
+	rawURL := strings.TrimSpace(body.URL)
+	if rawURL == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "URL is required"})
 		return
 	}
 
-	if !strings.HasPrefix(url, "http") {
-		url = "https://" + url
+	targetURL, err := parsePublicHTTPURL(rawURL)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(url)
+	client := newSafeHTTPClient()
+	resp, err := client.Get(targetURL.String())
 	if err != nil {
 		if strings.Contains(err.Error(), "timeout") {
 			w.WriteHeader(http.StatusRequestTimeout)
@@ -2047,10 +1326,26 @@ func (s *Server) handleParseURL(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	htmlData, err := io.ReadAll(resp.Body)
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if contentType != "" && !strings.HasPrefix(contentType, "text/html") &&
+		!strings.HasPrefix(contentType, "text/plain") && !strings.HasPrefix(contentType, "application/xhtml+xml") {
+		writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "URL must return HTML or plain text"})
+		return
+	}
+
+	const maxFetchedPageBytes = 4 << 20
+	if resp.ContentLength > maxFetchedPageBytes {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "URL content is too large"})
+		return
+	}
+	htmlData, err := io.ReadAll(io.LimitReader(resp.Body, maxFetchedPageBytes+1))
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to read URL content"})
+		return
+	}
+	if len(htmlData) > maxFetchedPageBytes {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "URL content is too large"})
 		return
 	}
 
@@ -2063,7 +1358,98 @@ func (s *Server) handleParseURL(w http.ResponseWriter, req *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{"text": text, "source": url})
+	json.NewEncoder(w).Encode(map[string]interface{}{"text": text, "source": targetURL.String()})
+}
+
+func parsePublicHTTPURL(raw string) (*neturl.URL, error) {
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	target, err := neturl.Parse(raw)
+	if err != nil || target.Hostname() == "" {
+		return nil, fmt.Errorf("invalid URL")
+	}
+	if target.Scheme != "http" && target.Scheme != "https" {
+		return nil, fmt.Errorf("only HTTP and HTTPS URLs are allowed")
+	}
+	if target.User != nil {
+		return nil, fmt.Errorf("URL credentials are not allowed")
+	}
+	if port := target.Port(); port != "" && port != "80" && port != "443" {
+		return nil, fmt.Errorf("only ports 80 and 443 are allowed")
+	}
+	return target, nil
+}
+
+func isPublicIP(ip net.IP) bool {
+	return ip != nil && !ip.IsLoopback() && !ip.IsPrivate() && !ip.IsUnspecified() &&
+		!ip.IsLinkLocalUnicast() && !ip.IsLinkLocalMulticast() && !ip.IsInterfaceLocalMulticast() &&
+		!ip.IsMulticast()
+}
+
+func resolvePublicIPs(ctx context.Context, hostname string) ([]net.IP, error) {
+	if ip := net.ParseIP(hostname); ip != nil {
+		if !isPublicIP(ip) {
+			return nil, fmt.Errorf("private or local addresses are not allowed")
+		}
+		return []net.IP{ip}, nil
+	}
+	addresses, err := net.DefaultResolver.LookupIPAddr(ctx, hostname)
+	if err != nil {
+		return nil, fmt.Errorf("URL host lookup failed: %w", err)
+	}
+	public := make([]net.IP, 0, len(addresses))
+	for _, address := range addresses {
+		if !isPublicIP(address.IP) {
+			return nil, fmt.Errorf("private or local addresses are not allowed")
+		}
+		public = append(public, address.IP)
+	}
+	if len(public) == 0 {
+		return nil, fmt.Errorf("URL host has no public address")
+	}
+	return public, nil
+}
+
+func newSafeHTTPClient() *http.Client {
+	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil, err
+			}
+			ips, err := resolvePublicIPs(ctx, host)
+			if err != nil {
+				return nil, err
+			}
+			var lastErr error
+			for _, ip := range ips {
+				conn, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+				if dialErr == nil {
+					return conn, nil
+				}
+				lastErr = dialErr
+			}
+			return nil, lastErr
+		},
+		TLSHandshakeTimeout: 5 * time.Second,
+	}
+	return &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("too many redirects")
+			}
+			_, err := parsePublicHTTPURL(req.URL.String())
+			if err != nil {
+				return err
+			}
+			_, err = resolvePublicIPs(req.Context(), req.URL.Hostname())
+			return err
+		},
+	}
 }
 
 func extractTextFromHtml(htmlContent string) string {
@@ -2223,7 +1609,7 @@ func getContentType(ext string) string {
 		return "text/html; charset=utf-8"
 	case ".css":
 		return "text/css; charset=utf-8"
-	case ".js":
+	case ".js", ".mjs":
 		return "application/javascript; charset=utf-8"
 	case ".json":
 		return "application/json; charset=utf-8"
@@ -2419,4 +1805,3 @@ function renderDiagnosis(items){
 
 function escapeHtml(s){return (s||'').replace(/[&<>\"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 `
-

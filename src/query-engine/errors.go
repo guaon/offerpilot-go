@@ -16,6 +16,7 @@ const (
 	ErrorCategoryInvalidRequest ErrorCategory = "invalid_request"
 	ErrorCategoryAuth           ErrorCategory = "auth"
 	ErrorCategoryContextLength  ErrorCategory = "context_length"
+	ErrorCategoryUnavailable    ErrorCategory = "unavailable"
 	ErrorCategoryUnknown        ErrorCategory = "unknown"
 )
 
@@ -75,6 +76,11 @@ func ClassifyError(err error) *QueryEngineError {
 	// Timeout
 	if strings.Contains(message, "timeout") || strings.Contains(message, "ETIMEDOUT") {
 		return NewQueryEngineError("Timeout", ErrorCategoryTimeout, true, 3000)
+	}
+
+	// Empty response (model returned nothing) — retryable
+	if strings.Contains(message, "empty") {
+		return NewQueryEngineError(message, ErrorCategoryUnknown, true, 2000)
 	}
 
 	// Network error

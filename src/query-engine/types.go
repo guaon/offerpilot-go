@@ -100,9 +100,22 @@ func (e *ErrorEvent) GetType() string { return "error" }
 type Message struct {
 	Role       MessageRole
 	Content    *string
+	Images     []ImageInput
 	ToolCallID *string
 	ToolCalls  *[]ToolCall
 	IsError    *bool
+}
+
+type ImageInput struct {
+	URL    string
+	Detail string
+}
+
+type ResponseFormat struct {
+	Type   string
+	Name   string
+	Strict bool
+	Schema map[string]interface{}
 }
 
 type ToolSchema struct {
@@ -112,13 +125,14 @@ type ToolSchema struct {
 }
 
 type StreamParams struct {
-	Model        string
-	Messages     []Message
-	Tools        []ToolSchema
-	MaxTokens    int
-	Temperature  float64
-	SystemPrompt string
-	AbortSignal  context.Context
+	Model          string
+	Messages       []Message
+	Tools          []ToolSchema
+	MaxTokens      int
+	Temperature    float64
+	SystemPrompt   string
+	ResponseFormat *ResponseFormat
+	AbortSignal    context.Context
 }
 
 type QueryParams struct {
@@ -129,10 +143,13 @@ type QueryParams struct {
 	MaxTokens       *int
 	Temperature     *float64
 	SystemPrompt    *string
+	ResponseFormat  *ResponseFormat
 	UseCache        *bool
 	CacheTtl        *int
 	OnTextDelta     func(text string)
 	OnThinkingDelta func(text string)
+	OnRetry         func(attempt int, maxRetries int, reason string)
+	Context         context.Context
 }
 
 type LLMProvider interface {

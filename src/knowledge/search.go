@@ -163,9 +163,11 @@ func (ks *KnowledgeSearch) ftsSearch(query, dimension string, limit int) ([]*Sea
 		if len(entry.Content) > 8000 {
 			entry.Content = entry.Content[:8000]
 		}
+		// FTS5 rank 为负值（越接近 0 越相关），归一化到 0~1，与 embedding 余弦相似度同尺度
+		normalizedScore := 1.0 / (1.0 + math.Abs(rank))
 		results = append(results, &SearchResult{
 			Entry:     &entry,
-			Score:     math.Abs(rank),
+			Score:     normalizedScore,
 			MatchType: MatchTypeFTS,
 		})
 	}
@@ -589,34 +591,52 @@ func (ks *KnowledgeSearch) deserializeVector(buf []byte) []float64 {
 }
 
 func (ks *KnowledgeSearch) mergeResults(fts, emb []*SearchResult, limit int) []*SearchResult {
-	seen := make(map[string]bool)
-	var merged []*SearchResult
+	seen := make(map[string]*SearchResult)
 
-	all := append(fts, emb...)
-	for i := 0; i < len(all)-1; i++ {
-		for j := i + 1; j < len(all); j++ {
-			if all[j].Score > all[i].Score {
-				all[i], all[j] = all[j], all[i]
-			}
-		}
-
-	}
-
-	for _, result := range all {
-		if seen[result.Entry.SourceFile] {
+	// 第一遍：FTS 结果入 map（按 Entry.ID 去重）
+	for _, r := range fts {
+		if r.Entry == nil {
 			continue
 		}
-		seen[result.Entry.SourceFile] = true
-		merged = append(merged, &SearchResult{
-			Entry:     result.Entry,
-			Score:     result.Score,
+		seen[r.Entry.ID] = &SearchResult{
+			Entry:     r.Entry,
+			Score:     r.Score,
 			MatchType: MatchTypeHybrid,
-		})
-
-		if len(merged) >= limit {
-			break
 		}
+	}
 
+	// 第二遍：embedding 结果合并，双命中则加权
+	for _, r := range emb {
+		if r.Entry == nil {
+			continue
+		}
+		if existing, ok := seen[r.Entry.ID]; ok {
+			// 同一条目被 FTS 和 embedding 同时命中 → 平均分 + 0.15 加权
+			existing.Score = (existing.Score+r.Score)/2.0 + 0.15
+		} else {
+			seen[r.Entry.ID] = &SearchResult{
+				Entry:     r.Entry,
+				Score:     r.Score,
+				MatchType: MatchTypeHybrid,
+			}
+		}
+	}
+
+	// 转为切片并按分数降序排列
+	merged := make([]*SearchResult, 0, len(seen))
+	for _, r := range seen {
+		merged = append(merged, r)
+	}
+	for i := 0; i < len(merged)-1; i++ {
+		for j := i + 1; j < len(merged); j++ {
+			if merged[j].Score > merged[i].Score {
+				merged[i], merged[j] = merged[j], merged[i]
+			}
+		}
+	}
+
+	if limit > 0 && limit < len(merged) {
+		merged = merged[:limit]
 	}
 
 	return merged

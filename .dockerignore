@@ -1,0 +1,38 @@
+# 编译产物
+*.exe
+*.dll
+*.so
+*.dylib
+
+# 数据库文件
+*.db
+*.sqlite
+
+# 日志
+*.log
+
+# IDE
+.idea/
+.vscode/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.bak
+
+# 环境变量（通过 docker run -e 注入）
+.env
+.env.local
+.env.*.local
+
+# Git
+.git/
+.gitignore
+
+# 文档
+docs/
+knowledge/
+README.md

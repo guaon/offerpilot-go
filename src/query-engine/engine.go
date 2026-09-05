@@ -3,6 +3,8 @@ package queryengine
 import (
 	"context"
 	"errors"
+	"math"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -32,7 +34,7 @@ func NewQueryEngine(opts QueryEngineOptions) *QueryEngine {
 
 }
 
-//找对的AI、处理流式回复、自动重试，最后给出完整的答案
+// 找对的AI、处理流式回复、自动重试，最后给出完整的答案
 func (qe *QueryEngine) Query(params QueryParams) (ParsedResponse, error) {
 	log := logger.DefaultLogger
 
@@ -40,7 +42,10 @@ func (qe *QueryEngine) Query(params QueryParams) (ParsedResponse, error) {
 	if params.Model != nil {
 		model = *params.Model
 	}
-	result := qe.router.Resolve(model)
+	result, err := qe.router.Resolve(model)
+	if err != nil {
+		return ParsedResponse{}, NewQueryEngineError(err.Error(), ErrorCategoryUnavailable, false, 0)
+	}
 
 	tools := []ToolSchema{}
 	if params.Tools != nil {
@@ -63,8 +68,8 @@ func (qe *QueryEngine) Query(params QueryParams) (ParsedResponse, error) {
 	}
 
 	log.Info("QueryEngine processing request", map[string]interface{}{
-		"model":         result.Model,
-		"provider":      result.Provider.Name(),
+		"model":        result.Model,
+		"provider":     result.Provider.Name(),
 		"messageCount": len(params.Messages),
 		"toolCount":    len(tools),
 		"maxTokens":    maxTokens,
@@ -73,16 +78,35 @@ func (qe *QueryEngine) Query(params QueryParams) (ParsedResponse, error) {
 
 	startTime := time.Now()
 
-	return WithRetryResult(func() (ParsedResponse, error) {
+	// 内联重试循环，支持 OnRetry 回调通知上层
+	maxRetries := defaultMaxRetries
+	baseDelay := defaultBaseDelay
+	maxDelay := defaultMaxDelay
+	if qe.retryOpts != nil {
+		if qe.retryOpts.MaxRetries > 0 {
+			maxRetries = qe.retryOpts.MaxRetries
+		}
+		if qe.retryOpts.BaseDelay > 0 {
+			baseDelay = qe.retryOpts.BaseDelay
+		}
+		if qe.retryOpts.MaxDelay > 0 {
+			maxDelay = qe.retryOpts.MaxDelay
+		}
+	}
+
+	var lastQueryErr *QueryEngineError
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		collector := NewStreamCollector()
 
 		stream := result.Provider.Stream(StreamParams{
-			Model:        result.Model,
-			Messages:     params.Messages,
-			Tools:        tools,
-			MaxTokens:    maxTokens,
-			Temperature:  temperature,
-			SystemPrompt: systemPrompt,
+			Model:          result.Model,
+			Messages:       params.Messages,
+			Tools:          tools,
+			MaxTokens:      maxTokens,
+			Temperature:    temperature,
+			SystemPrompt:   systemPrompt,
+			ResponseFormat: params.ResponseFormat,
+			AbortSignal:    params.Context,
 		})
 
 		for event := range stream {
@@ -92,9 +116,11 @@ func (qe *QueryEngine) Query(params QueryParams) (ParsedResponse, error) {
 						"error":     errorEvent.Err.Error(),
 						"component": "QueryEngine",
 					})
-					return ParsedResponse{}, errorEvent.Err
+					lastQueryErr = ClassifyError(errorEvent.Err)
+					break
 				}
-				return ParsedResponse{}, errors.New("model stream returned an unknown error")
+				lastQueryErr = ClassifyError(errors.New("model stream returned an unknown error"))
+				break
 			}
 			collector.Feed(event)
 			if event.GetType() == "text_delta" && params.OnTextDelta != nil {
@@ -109,58 +135,101 @@ func (qe *QueryEngine) Query(params QueryParams) (ParsedResponse, error) {
 
 		}
 
-		result := collector.Result()
+		// 流错误重试
+		if lastQueryErr != nil {
+			if !lastQueryErr.Retryable || attempt == maxRetries {
+				return ParsedResponse{}, lastQueryErr
+			}
+			if params.OnRetry != nil {
+				params.OnRetry(attempt+1, maxRetries, lastQueryErr.Message)
+			}
+			delay := retryDelay(attempt, baseDelay, maxDelay, lastQueryErr.RetryAfterMs)
+			time.Sleep(delay)
+			lastQueryErr = nil
+			continue
+		}
+
+		resp := collector.Result()
 		elapsed := time.Since(startTime)
 
+		// 空流检测：没有任何内容也没有工具调用 → 触发重试
+		if resp.Type == "text" && resp.Content == nil && len(collector.ToolCalls) == 0 {
+			log.Warn("QueryEngine received empty stream", map[string]interface{}{
+				"duration":  elapsed.String(),
+				"component": "QueryEngine",
+			})
+			emptyErr := &QueryEngineError{Message: "model returned empty response", Category: ErrorCategoryUnknown, Retryable: true}
+			if attempt == maxRetries {
+				return ParsedResponse{}, emptyErr
+			}
+			if params.OnRetry != nil {
+				params.OnRetry(attempt+1, maxRetries, emptyErr.Message)
+			}
+			delay := retryDelay(attempt, baseDelay, maxDelay, 2000)
+			time.Sleep(delay)
+			continue
+		}
+
 		log.Info("QueryEngine request completed", map[string]interface{}{
-			"responseType": result.Type,
+			"responseType": resp.Type,
 			"duration":     elapsed.String(),
-			"inputTokens":  result.Usage.InputTokens,
-			"outputTokens": result.Usage.OutputTokens,
+			"inputTokens":  resp.Usage.InputTokens,
+			"outputTokens": resp.Usage.OutputTokens,
 			"component":    "QueryEngine",
 		})
 
-		if result.Type == "tool_use" && result.ToolCalls != nil {
-			toolNames := make([]string, len(*result.ToolCalls))
-			for i, tc := range *result.ToolCalls {
+		if resp.Type == "tool_use" && resp.ToolCalls != nil {
+			toolNames := make([]string, len(*resp.ToolCalls))
+			for i, tc := range *resp.ToolCalls {
 				toolNames[i] = tc.Name
 			}
 			log.Info("QueryEngine returning tool calls", map[string]interface{}{
-				"toolCount": len(*result.ToolCalls),
+				"toolCount": len(*resp.ToolCalls),
 				"toolNames": strings.Join(toolNames, ", "),
 				"component": "QueryEngine",
 			})
-		} else if result.Type == "text" && result.Content != nil {
-			content := *result.Content
+		} else if resp.Type == "text" && resp.Content != nil {
+			content := *resp.Content
 			preview := content
 			if len(content) > 200 {
 				preview = content[:200] + "..."
 			}
 			log.Info("QueryEngine returning text response", map[string]interface{}{
-				"contentLength": len(content),
+				"contentLength":  len(content),
 				"contentPreview": preview,
-				"component":    "QueryEngine",
+				"component":      "QueryEngine",
 			})
 		}
 
-		return result, nil
-	}, qe.retryOpts)
+		return resp, nil
+	}
+
+	return ParsedResponse{}, lastQueryErr
 }
 
 func (qe *QueryEngine) StreamRaw(ctx context.Context, params QueryParams) <-chan StreamEvent {
-	result := qe.router.Resolve(*params.Model)
+	output := make(chan StreamEvent, 1)
+	model := ""
+	if params.Model != nil {
+		model = *params.Model
+	}
+	result, err := qe.router.Resolve(model)
+	if err != nil {
+		output <- &ErrorEvent{Err: err}
+		close(output)
+		return output
+	}
 
 	stream := result.Provider.Stream(StreamParams{
-		Model:        result.Model,
-		Messages:     params.Messages,
-		Tools:        *params.Tools,
-		MaxTokens:    *params.MaxTokens,
-		Temperature:  *params.Temperature,
-		SystemPrompt: *params.SystemPrompt,
-		AbortSignal:  ctx,
+		Model:          result.Model,
+		Messages:       params.Messages,
+		Tools:          *params.Tools,
+		MaxTokens:      *params.MaxTokens,
+		Temperature:    *params.Temperature,
+		SystemPrompt:   *params.SystemPrompt,
+		ResponseFormat: params.ResponseFormat,
+		AbortSignal:    ctx,
 	})
-
-	output := make(chan StreamEvent)
 
 	go func() {
 		defer close(output)
@@ -183,10 +252,30 @@ func (qe *QueryEngine) CountTokens(params struct {
 	Messages []Message
 	Tools    []ToolSchema
 }) (int, error) {
-	result := qe.router.Resolve(params.Model)
+	result, err := qe.router.Resolve(params.Model)
+	if err != nil {
+		return 0, err
+	}
 	return result.Provider.CountTokens(params.Messages, params.Tools, result.Model)
+}
+
+// retryDelay 计算重试等待时间
+func retryDelay(attempt int, baseDelay, maxDelay time.Duration, retryAfterMs int) time.Duration {
+	if retryAfterMs > 0 {
+		return time.Duration(retryAfterMs) * time.Millisecond
+	}
+	jitter := rand.Float64()*0.3 + 0.85
+	delay := time.Duration(float64(baseDelay) * jitter * math.Pow(2, float64(attempt)))
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+	return delay
 }
 
 func (qe *QueryEngine) ListProviders() []string {
 	return qe.router.ListProviders()
+}
+
+func (qe *QueryEngine) Available() bool {
+	return len(qe.router.Configs) > 0
 }

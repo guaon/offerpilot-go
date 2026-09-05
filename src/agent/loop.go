@@ -40,6 +40,9 @@ type AgentConfig struct {
 	OnDiagnosisRecord func(sessionID string, dimension string, score int, question string)
 	// OnInterviewQuestions is passed to mock_interview to persist the question sequence.
 	OnInterviewQuestions func(questions []string)
+	// OnProgress notifies the caller about agent loop progress (iteration, tool execution, retry).
+	OnProgress func(stage string, detail map[string]interface{})
+	OnRetry    func(attempt int, maxRetries int, reason string)
 }
 
 type AgentLoop struct {
@@ -76,6 +79,7 @@ func (al *AgentLoop) GetUsage() UsageStats {
 }
 
 func (al *AgentLoop) Run(ctx context.Context, sessionID string, userID string, userMessage string) (string, error) {
+	al.usage = UsageStats{}
 	config := al.config
 
 	log := logger.DefaultLogger
@@ -110,7 +114,7 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID string, userID string, u
 	var profileText strings.Builder
 
 	// 第二层：结构化画像（求职信息）
-	if p := config.MemoryStore.GetProfile(); p != nil {
+	if p := config.MemoryStore.GetProfile(userID); p != nil {
 		if p.JobDirection != "" || p.TargetPosition != "" || p.CurrentSituation != "" {
 			profileText.WriteString("【用户结构化画像】\n")
 			if p.JobDirection != "" {
@@ -126,7 +130,7 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID string, userID string, u
 	}
 
 	// 第二层：知识点掌握情况
-	if points := config.MemoryStore.GetKnowledgePoints(); len(points) > 0 {
+	if points := config.MemoryStore.GetKnowledgePoints(userID); len(points) > 0 {
 		profileText.WriteString("【知识点掌握情况】\n")
 		for _, p := range points {
 			status := "未掌握"
@@ -138,7 +142,7 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID string, userID string, u
 	}
 
 	// 第一层：活性画像（面试题目序列 + 当前进度）
-	if ap := config.MemoryStore.GetActiveProfile(); ap != nil {
+	if ap := config.MemoryStore.GetActiveProfile(sessionID); ap != nil {
 		if len(ap.Questions) > 0 {
 			profileText.WriteString("【本次面试题目序列】\n")
 			for i, q := range ap.Questions {
@@ -158,7 +162,11 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID string, userID string, u
 	}
 
 	// 历史记忆（weakness/strength/face/preference）
-	memories := config.MemoryStore.Query(memory.MemoryQuery{UserID: userID, Limit: 5})
+	memoryQuery := memory.MemoryQuery{UserID: userID, Limit: 5}
+	if userID == "" {
+		memoryQuery.SessionID = sessionID
+	}
+	memories := config.MemoryStore.Query(memoryQuery)
 	if len(memories) > 0 {
 		profileText.WriteString("【历史记忆】\n")
 		for _, m := range memories {
@@ -197,11 +205,19 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID string, userID string, u
 		}
 
 		log.Info("AI iteration started", map[string]interface{}{
-			"sessionID":  sessionID,
-			"iteration":  i + 1,
+			"sessionID":   sessionID,
+			"iteration":   i + 1,
 			"totalTokens": al.usage.TotalTokens,
-			"component":  "AgentLoop",
+			"component":   "AgentLoop",
 		})
+
+		if config.OnProgress != nil {
+			config.OnProgress("iterating", map[string]interface{}{
+				"iteration":     i + 1,
+				"maxIterations": al.maxIterations,
+				"step":          "querying_model",
+			})
+		}
 
 		compressed := config.ContextManager.Compress(queryMessages, 0)
 		if compressed.Level != appcontext.CompressionLevelNone {
@@ -223,6 +239,7 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID string, userID string, u
 			SystemPrompt:    &systemPrompt,
 			OnTextDelta:     config.OnTextDelta,
 			OnThinkingDelta: config.OnThinkingDelta,
+			OnRetry:         config.OnRetry,
 		}
 
 		response, err := config.QueryEngine.Query(params)
@@ -246,11 +263,11 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID string, userID string, u
 
 		if response.Type == "tool_use" && response.ToolCalls != nil && len(*response.ToolCalls) > 0 {
 			log.Info("AI requesting tool calls", map[string]interface{}{
-				"sessionID":   sessionID,
-				"iteration":   i + 1,
-				"toolCount":   len(*response.ToolCalls),
-				"toolNames":   getToolNames(*response.ToolCalls),
-				"component":   "AgentLoop",
+				"sessionID": sessionID,
+				"iteration": i + 1,
+				"toolCount": len(*response.ToolCalls),
+				"toolNames": getToolNames(*response.ToolCalls),
+				"component": "AgentLoop",
 			})
 
 			if config.OnToolCall != nil {
@@ -298,7 +315,22 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID string, userID string, u
 			})
 
 			for _, toolCall := range *response.ToolCalls {
+				if config.OnProgress != nil {
+					config.OnProgress("tool_executing", map[string]interface{}{
+						"iteration": i + 1,
+						"toolName":  toolCall.Name,
+						"step":      "executing_tool",
+					})
+				}
 				result, err := al.executeTool(ctx, toolCall, sessionID)
+				if config.OnProgress != nil {
+					config.OnProgress("tool_done", map[string]interface{}{
+						"iteration": i + 1,
+						"toolName":  toolCall.Name,
+						"success":   err == nil,
+						"step":      "tool_completed",
+					})
+				}
 				if err != nil {
 					return "", err
 				}
@@ -363,10 +395,10 @@ func (al *AgentLoop) executeTool(ctx context.Context, toolCall queryengine.ToolC
 	log := logger.DefaultLogger
 
 	log.Info("Tool call started", map[string]interface{}{
-		"sessionID":  sessionID,
-		"toolName":   toolCall.Name,
-		"toolInput":  formatToolInput(toolCall.Input),
-		"component":  "AgentLoop",
+		"sessionID": sessionID,
+		"toolName":  toolCall.Name,
+		"toolInput": formatToolInput(toolCall.Input),
+		"component": "AgentLoop",
 	})
 
 	toolDef := al.config.ToolRegistry.Get(toolCall.Name)
@@ -376,18 +408,18 @@ func (al *AgentLoop) executeTool(ctx context.Context, toolCall queryengine.ToolC
 			"toolName":  toolCall.Name,
 			"component": "AgentLoop",
 		})
-		return nil, nil
+		return nil, fmt.Errorf("tool %q not found in registry", toolCall.Name)
 	}
 
 	riskLevel := permission.RiskLevel(toolDef.RiskLevel)
 	decisionResult := al.config.PermissionGate.Check(toolCall.Name, riskLevel, sessionID)
 	if !decisionResult.Allowed {
 		log.Warn("Tool permission denied", map[string]interface{}{
-			"sessionID":  sessionID,
-			"toolName":   toolCall.Name,
-			"riskLevel":  riskLevel,
-			"reason":     decisionResult.Reason,
-			"component":  "AgentLoop",
+			"sessionID": sessionID,
+			"toolName":  toolCall.Name,
+			"riskLevel": riskLevel,
+			"reason":    decisionResult.Reason,
+			"component": "AgentLoop",
 		})
 		return &tool.ToolResult{
 			Success: false,
@@ -474,8 +506,8 @@ func (al *AgentLoop) convertToQueryEngineMessages(messages []*schema.Message) []
 				toolCalls := make([]queryengine.ToolCall, 0, len(msg.ToolCalls))
 				for _, tc := range msg.ToolCalls {
 					toolCalls = append(toolCalls, queryengine.ToolCall{
-						ID:   tc.ID,
-						Name: tc.Function.Name,
+						ID:    tc.ID,
+						Name:  tc.Function.Name,
 						Input: nil,
 					})
 				}
@@ -652,7 +684,11 @@ func (al *AgentLoop) extractProfile(userID, sessionID, userMessage string) {
 		content := r.label + ": " + snippet
 
 		// 去重：已有同 user 同 type 同内容则跳过
-		existing := ms.Query(memory.MemoryQuery{UserID: userID, Type: r.mtype})
+		query := memory.MemoryQuery{UserID: userID, Type: r.mtype}
+		if userID == "" {
+			query.SessionID = sessionID
+		}
+		existing := ms.Query(query)
 		dup := false
 		for _, e := range existing {
 			if strings.Contains(e.Content, snippet) {

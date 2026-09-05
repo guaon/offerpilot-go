@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 
@@ -9,17 +10,22 @@ import (
 )
 
 func main() {
+	skipEmbeddings := flag.Bool("skip-embeddings", false, "Skip embedding generation (useful when API quota is exhausted)")
+	flag.Parse()
+
 	env.LoadEnvFile()
 
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: build_kb <knowledge_dir>")
+	knowledgeDir := flag.Arg(0)
+	if knowledgeDir == "" {
+		fmt.Println("Usage: build_kb [--skip-embeddings] <knowledge_dir>")
 		os.Exit(1)
 	}
 
-	knowledgeDir := os.Args[1]
-
 	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey == "" {
+	if *skipEmbeddings {
+		apiKey = ""
+		fmt.Println("Skipping embeddings (--skip-embeddings)")
+	} else if apiKey == "" {
 		fmt.Println("Warning: OPENAI_API_KEY not set, embeddings will be skipped")
 	}
 
@@ -34,6 +40,11 @@ func main() {
 		os.Exit(1)
 	}
 	defer builder.Close()
+
+	if err := builder.Clear(); err != nil {
+		fmt.Printf("Failed to clear knowledge base: %v\n", err)
+		os.Exit(1)
+	}
 
 	if err := builder.BuildFromDir(knowledgeDir); err != nil {
 		fmt.Printf("Failed to build knowledge base: %v\n", err)

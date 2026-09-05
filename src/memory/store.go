@@ -4,17 +4,19 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
 
 type MemoryStore struct {
+	mu              sync.Mutex
 	entries         []*MemoryEntry
 	db              *sql.DB
-	active          *ActiveProfile    // 第一层活性画像（内存态）
-	knowledgePoints []KnowledgePoint  // 第二层知识点缓存
-	profile         *StructuredProfile // 第二层结构化画像缓存
+	active          map[string]*ActiveProfile
+	knowledgePoints []KnowledgePoint // 第二层知识点缓存
+	profiles        map[string]*StructuredProfile
 }
 
 // NewMemoryStore 创建 MemoryStore。db 为 MySQL 连接；传 nil 则仅内存模式（不持久化）。
@@ -22,8 +24,9 @@ func NewMemoryStore(db *sql.DB) (*MemoryStore, error) {
 	store := &MemoryStore{
 		db:              db,
 		entries:         make([]*MemoryEntry, 0),
-		active:          &ActiveProfile{},
+		active:          make(map[string]*ActiveProfile),
 		knowledgePoints: make([]KnowledgePoint, 0),
+		profiles:        make(map[string]*StructuredProfile),
 	}
 	if db != nil {
 		if err := store.loadFromDB(); err != nil {
@@ -35,6 +38,9 @@ func NewMemoryStore(db *sql.DB) (*MemoryStore, error) {
 }
 
 func (s *MemoryStore) Add(entry MemoryEntry) *MemoryEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	now := time.Now().UnixMilli()
 	full := &MemoryEntry{
 		ID:             uuid.New().String(),
@@ -56,10 +62,14 @@ func (s *MemoryStore) Add(entry MemoryEntry) *MemoryEntry {
 			full.ID, full.UserID, full.SessionID, string(full.Type), full.Content, full.Importance, 0, full.CreateAt, full.LastAccessedAt)
 	}
 
-	return full
+	copy := *full
+	return &copy
 }
 
 func (s *MemoryStore) Query(q MemoryQuery) []*MemoryEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	results := make([]*MemoryEntry, 0, len(s.entries))
 	for _, e := range s.entries {
 		if q.UserID != "" && e.UserID != q.UserID {
@@ -106,20 +116,32 @@ func (s *MemoryStore) Query(q MemoryQuery) []*MemoryEntry {
 			`, entry.AccessCount, entry.LastAccessedAt, entry.ID)
 		}
 	}
-	return results
+	copies := make([]*MemoryEntry, len(results))
+	for i, entry := range results {
+		copy := *entry
+		copies[i] = &copy
+	}
+	return copies
 }
 
 func (s *MemoryStore) GetBySession(sessionID string) []*MemoryEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	var results []*MemoryEntry
 	for _, e := range s.entries {
 		if e.SessionID == sessionID {
-			results = append(results, e)
+			copy := *e
+			results = append(results, &copy)
 		}
 	}
 	return results
 }
 
 func (s *MemoryStore) Remove(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	for i, e := range s.entries {
 		if e.ID == id {
 			s.entries = append(s.entries[:i], s.entries[i+1:]...)
@@ -135,6 +157,8 @@ func (s *MemoryStore) Remove(id string) bool {
 }
 
 func (s *MemoryStore) Size() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return len(s.entries)
 }
 
@@ -154,6 +178,8 @@ func (s *MemoryStore) LoadFromMySQL(userID string) error {
 		return fmt.Errorf("query memories failed: %w", err)
 	}
 	defer rows.Close()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	for rows.Next() {
 		var entry MemoryEntry
@@ -227,35 +253,81 @@ func (s *MemoryStore) loadFromDB() error {
 }
 
 // GetActiveProfile 返回第一层活性画像（内存态）。
-func (s *MemoryStore) GetActiveProfile() *ActiveProfile {
+func (s *MemoryStore) GetActiveProfile(sessionID string) *ActiveProfile {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.active == nil {
-		s.active = &ActiveProfile{}
+		s.active = make(map[string]*ActiveProfile)
 	}
-	return s.active
+	profile := s.active[sessionID]
+	if profile == nil {
+		return &ActiveProfile{}
+	}
+	copy := *profile
+	copy.Questions = append([]string(nil), profile.Questions...)
+	copy.StuckPoints = append([]string(nil), profile.StuckPoints...)
+	copy.ExpressionNotes = append([]string(nil), profile.ExpressionNotes...)
+	return &copy
 }
 
 // UpdateActiveProfile 更新第一层活性画像。
-func (s *MemoryStore) UpdateActiveProfile(ap ActiveProfile) {
+func (s *MemoryStore) UpdateActiveProfile(sessionID string, ap ActiveProfile) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active == nil {
+		s.active = make(map[string]*ActiveProfile)
+	}
 	ap.UpdatedAt = time.Now().UnixMilli()
-	s.active = &ap
+	ap.Questions = append([]string(nil), ap.Questions...)
+	ap.StuckPoints = append([]string(nil), ap.StuckPoints...)
+	ap.ExpressionNotes = append([]string(nil), ap.ExpressionNotes...)
+	s.active[sessionID] = &ap
 }
 
 // GetKnowledgePoints 返回第二层知识点缓存。
-func (s *MemoryStore) GetKnowledgePoints() []KnowledgePoint {
-	return s.knowledgePoints
+func (s *MemoryStore) GetKnowledgePoints(userID string) []KnowledgePoint {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	points := make([]KnowledgePoint, 0)
+	for _, point := range s.knowledgePoints {
+		if point.UserID == userID {
+			points = append(points, point)
+		}
+	}
+	return points
 }
 
 // SetKnowledgePoints 设置第二层知识点缓存。
-func (s *MemoryStore) SetKnowledgePoints(points []KnowledgePoint) {
-	s.knowledgePoints = points
+func (s *MemoryStore) SetKnowledgePoints(userID string, points []KnowledgePoint) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	filtered := s.knowledgePoints[:0]
+	for _, point := range s.knowledgePoints {
+		if point.UserID != userID {
+			filtered = append(filtered, point)
+		}
+	}
+	s.knowledgePoints = append(filtered, points...)
 }
 
 // GetProfile 返回第二层结构化画像缓存。
-func (s *MemoryStore) GetProfile() *StructuredProfile {
-	return s.profile
+func (s *MemoryStore) GetProfile(userID string) *StructuredProfile {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.profiles == nil || s.profiles[userID] == nil {
+		return nil
+	}
+	copy := *s.profiles[userID]
+	return &copy
 }
 
 // SetProfile 设置第二层结构化画像缓存。
-func (s *MemoryStore) SetProfile(p *StructuredProfile) {
-	s.profile = p
+func (s *MemoryStore) SetProfile(userID string, p *StructuredProfile) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.profiles == nil {
+		s.profiles = make(map[string]*StructuredProfile)
+	}
+	copy := *p
+	s.profiles[userID] = &copy
 }

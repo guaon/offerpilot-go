@@ -4,6 +4,8 @@ import (
 	"errors"
 )
 
+var ErrNoProviders = errors.New("no providers configured")
+
 type ProviderConfig struct {
 	Provider     LLMProvider
 	Models       []string
@@ -35,13 +37,13 @@ func (pr *ProviderRouter) Register(config ProviderConfig) {
 }
 
 // 根据输入的模型名称或提供者名称，返回对应的提供者（Provider）和模型
-func (pr *ProviderRouter) Resolve(modelOrProvider string) *ResolveResult {
+func (pr *ProviderRouter) Resolve(modelOrProvider string) (*ResolveResult, error) {
 	if modelOrProvider != "" {
 		if byModel, ok := pr.ModelMap[modelOrProvider]; ok {
 			return &ResolveResult{
 				Provider: byModel,
 				Model:    modelOrProvider,
-			}
+			}, nil
 		}
 
 		for _, config := range pr.Configs {
@@ -49,20 +51,20 @@ func (pr *ProviderRouter) Resolve(modelOrProvider string) *ResolveResult {
 				return &ResolveResult{
 					Provider: config.Provider,
 					Model:    config.DefaultModel,
-				}
+				}, nil
 			}
 		}
 	}
 
 	if len(pr.Configs) == 0 {
-		panic(errors.New("no providers registered"))
+		return nil, ErrNoProviders
 	}
 
 	first := pr.Configs[0]
 	return &ResolveResult{
 		Provider: first.Provider,
 		Model:    first.DefaultModel,
-	}
+	}, nil
 }
 
 func (pr *ProviderRouter) ListProviders() []string {

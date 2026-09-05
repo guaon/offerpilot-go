@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/sashabaranov/go-openai"
 )
@@ -23,6 +24,12 @@ type OpenAIConfig struct {
 	Name        string
 	MaxTokens   int
 	Temperature float64
+}
+
+type openAIJSONSchema map[string]interface{}
+
+func (schema openAIJSONSchema) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}(schema))
 }
 
 func NewOpenAIProvider(ctx context.Context, config *OpenAIConfig) (*OpenAIProvider, error) {
@@ -72,16 +79,15 @@ func (p *OpenAIProvider) Stream(params queryengine.StreamParams) <-chan queryeng
 			Stream:   true,
 		}
 
-		if params.MaxTokens != 0 {
-			request.MaxTokens = params.MaxTokens
-		}
-		if params.Temperature != 0 {
+		applyOpenAITokenLimit(&request, params.Model, params.MaxTokens)
+		if params.Temperature != 0 && !isOpenAIReasoningModel(params.Model) {
 			request.Temperature = float32(params.Temperature)
 		}
 		if len(params.Tools) > 0 {
 			request.Tools = p.toOpenAITools(params.Tools)
 			request.ToolChoice = "auto"
 		}
+		request.ResponseFormat = toOpenAIResponseFormat(params.ResponseFormat)
 
 		stream, err := p.client.CreateChatCompletionStream(ctx, request)
 		if err != nil {
@@ -149,34 +155,22 @@ func (p *OpenAIProvider) Stream(params queryengine.StreamParams) <-chan queryeng
 }
 
 func (p *OpenAIProvider) CountTokens(messages []queryengine.Message, tools []queryengine.ToolSchema, modelName string) (int, error) {
-	openaiMessages := p.buildMessages(messages)
-
-	req := openai.ChatCompletionRequest{
-		Model:    modelName,
-		Messages: openaiMessages,
-	}
-
-	if len(tools) > 0 {
-		req.Tools = p.toOpenAITools(tools)
-	}
-
-	ctx := context.Background()
-	resp, err := p.client.CreateChatCompletion(ctx, req)
-	if err != nil {
-		return 0, fmt.Errorf("failed to count tokens: %w", err)
-	}
-
-	if resp.Usage.PromptTokens > 0 {
-		return resp.Usage.PromptTokens, nil
-	}
-
+	// 使用字符估算而非真实 API 调用，避免浪费配额。
+	// 粗略估算：英文约 4 字符/ token，中文约 1.5 字符/ token。
+	// 取折中值 2.5 字符/ token。
 	total := 0
 	for _, m := range messages {
 		if m.Content != nil {
 			total += len(*m.Content)
 		}
 	}
-	return total / 3, nil
+	// 工具定义的 JSON schema 也计入
+	for _, t := range tools {
+		if t.Description != "" {
+			total += len(t.Description)
+		}
+	}
+	return total * 2 / 5, nil // 字符数 × 0.4 ≈ token 数
 }
 
 func (p *OpenAIProvider) buildMessages(messages []queryengine.Message) []openai.ChatCompletionMessage {
@@ -233,10 +227,26 @@ func (p *OpenAIProvider) buildMessages(messages []queryengine.Message) []openai.
 				ToolCalls: toolCalls,
 			})
 		} else {
-			result = append(result, openai.ChatCompletionMessage{
-				Role:    role,
-				Content: content,
-			})
+			message := openai.ChatCompletionMessage{Role: role, Content: content}
+			if msg.Role == queryengine.MessageRoleUser && len(msg.Images) > 0 {
+				parts := []openai.ChatMessagePart{{Type: openai.ChatMessagePartTypeText, Text: content}}
+				for _, image := range msg.Images {
+					detail := openai.ImageURLDetailAuto
+					switch image.Detail {
+					case "high":
+						detail = openai.ImageURLDetailHigh
+					case "low":
+						detail = openai.ImageURLDetailLow
+					}
+					parts = append(parts, openai.ChatMessagePart{
+						Type:     openai.ChatMessagePartTypeImageURL,
+						ImageURL: &openai.ChatMessageImageURL{URL: image.URL, Detail: detail},
+					})
+				}
+				message.Content = ""
+				message.MultiContent = parts
+			}
+			result = append(result, message)
 		}
 	}
 
@@ -269,12 +279,50 @@ func (p *OpenAIProvider) mapStopReason(reason string) queryengine.StopReason {
 	}
 }
 
+func isOpenAIReasoningModel(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(model, "gpt-5") ||
+		strings.HasPrefix(model, "o1") ||
+		strings.HasPrefix(model, "o3") ||
+		strings.HasPrefix(model, "o4")
+}
+
+func applyOpenAITokenLimit(request *openai.ChatCompletionRequest, model string, limit int) {
+	if limit <= 0 {
+		return
+	}
+	if isOpenAIReasoningModel(model) {
+		request.MaxCompletionTokens = limit
+		return
+	}
+	request.MaxTokens = limit
+}
+
+func toOpenAIResponseFormat(format *queryengine.ResponseFormat) *openai.ChatCompletionResponseFormat {
+	if format == nil {
+		return nil
+	}
+	switch format.Type {
+	case "json_schema":
+		return &openai.ChatCompletionResponseFormat{
+			Type: openai.ChatCompletionResponseFormatTypeJSONSchema,
+			JSONSchema: &openai.ChatCompletionResponseFormatJSONSchema{
+				Name: format.Name, Schema: openAIJSONSchema(format.Schema), Strict: format.Strict,
+			},
+		}
+	case "json_object":
+		return &openai.ChatCompletionResponseFormat{Type: openai.ChatCompletionResponseFormatTypeJSONObject}
+	default:
+		return nil
+	}
+}
+
 func (p *OpenAIProvider) Validate(ctx context.Context) error {
 	req := openai.ChatCompletionRequest{
 		Model:    p.model,
 		Messages: []openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleUser, Content: "ping"}},
-		MaxTokens: 1,
 	}
+	applyOpenAITokenLimit(&req, p.model, 1)
 	_, err := p.client.CreateChatCompletion(ctx, req)
 	if err != nil {
 		return fmt.Errorf("openai validation failed: %w", err)

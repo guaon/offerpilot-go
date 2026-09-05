@@ -102,6 +102,12 @@ func detectDimension(path string) string {
 		"14-company":           "architecture",
 		"15-agent":             "architecture",
 		"coaching-methodology": "coaching",
+		"go-questions":         "go",
+		"java-questions":       "java",
+		"cpp-questions":        "cpp",
+		"python-questions":     "python",
+		"frontend-questions":   "frontend",
+		"system-design":        "system-design",
 	}
 
 	for prefix, dim := range dimensionMap {
